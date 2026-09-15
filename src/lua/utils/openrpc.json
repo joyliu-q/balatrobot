@@ -954,6 +954,10 @@
             "$ref": "#/components/schemas/Area",
             "description": "Cards remaining in deck (available during run)"
           },
+          "discard": {
+            "$ref": "#/components/schemas/Area",
+            "description": "Cards already discarded (available during run)"
+          },
           "pack": {
             "$ref": "#/components/schemas/Area",
             "description": "Currently open pack (available during pack opening phase)"

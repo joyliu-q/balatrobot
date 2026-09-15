@@ -2,6 +2,54 @@
 
 ---@type BB_LOGGER
 local BB_LOGGER = assert(SMODS.load_file("src/lua/utils/logger.lua"))()
+local socket = require("socket")
+
+-- In fast/headless mode the pack object can be removed on a different frame
+-- from the state transition. The destination state and readiness flags are
+-- therefore the authoritative completion signal; pack removal is useful
+-- corroborating evidence but must not be required for the response.
+local function state_stable()
+  return G.STATE_COMPLETE == true
+    and (not G.CONTROLLER or G.CONTROLLER.locked ~= true)
+end
+
+local function pack_closed()
+  return not G.pack_cards
+    or G.pack_cards.REMOVED
+    or G.STATE ~= G.STATES.SMODS_BOOSTER_OPENED
+end
+
+local function shop_ready()
+  return G.STATE == G.STATES.SHOP and state_stable()
+end
+
+-- Packs opened from a Blind tag return to blind selection, not the shop. In
+-- fast/headless mode that transition can retain the controller lock longer
+-- than the pack UI itself; return it to the Python harness, whose settle()
+-- loop owns the readiness wait, instead of misreporting a successful skip as
+-- an RPC failure.
+local function pack_destination_ready()
+  return shop_ready() or G.STATE == G.STATES.BLIND_SELECT
+end
+
+local function send_timeout(send_response, operation, started_at)
+  if socket.gettime() - started_at <= 6 then
+    return false
+  end
+  sendDebugMessage(
+    string.format("pack() %s timed out in state %s", operation, tostring(G.STATE)),
+    "BB.ENDPOINTS"
+  )
+  send_response({
+    message = string.format(
+      "Pack %s did not reach a stable destination state (current state: %s)",
+      operation,
+      tostring(G.STATE)
+    ),
+    name = BB_ERROR_NAMES.INTERNAL_ERROR,
+  })
+  return true
+end
 
 -- ==========================================================================
 -- Pack Select Endpoint Params
@@ -260,11 +308,12 @@ return {
               return true
             end
           else
-            -- Pack closes - wait for return to shop
-            local pack_closed = not G.pack_cards or G.pack_cards.REMOVED
-            local back_to_shop = G.STATE == G.STATES.SHOP
+            -- A purchased pack returns to shop; a tag-granted pack returns
+            -- to blind selection.
+            local pack_closed_now = pack_closed()
+            local at_destination = pack_destination_ready()
 
-            if pack_closed and back_to_shop then
+            if pack_closed_now and at_destination then
               sendDebugMessage("Return pack() after selection", "BB.ENDPOINTS")
               send_response(BB_GAMESTATE.get_gamestate())
               return true
@@ -279,21 +328,26 @@ return {
 
     -- Handle skip
     if args.skip then
+      local started_at = socket.gettime()
       local pack_count = G.pack_cards.config and G.pack_cards.config.card_count or 0
       sendDebugMessage(string.format("Pack: skipping (%d cards remaining)", pack_count), "BB.ENDPOINTS")
       G.FUNCS.skip_booster({})
 
-      -- Wait for pack to close and return to shop
+      -- Wait for the destination. Tag-granted packs return to blind select.
       G.E_MANAGER:add_event(Event({
         trigger = "condition",
         blocking = false,
         func = function()
-          local pack_closed = not G.pack_cards or G.pack_cards.REMOVED
-          local back_to_shop = G.STATE == G.STATES.SHOP
+          local pack_closed_now = pack_closed()
+          local at_destination = pack_destination_ready()
 
-          if pack_closed and back_to_shop then
+          if pack_closed_now and at_destination then
             sendDebugMessage("Return pack() after skip", "BB.ENDPOINTS")
             send_response(BB_GAMESTATE.get_gamestate())
+            return true
+          end
+
+          if send_timeout(send_response, "skip", started_at) then
             return true
           end
 

@@ -729,6 +729,12 @@ function gamestate.get_gamestate()
 
   local state_data = {
     state = get_state_name(G.STATE),
+    -- These are transport/readiness details for the Python harness.  They are
+    -- deliberately not part of the compact model prompt, but let the client
+    -- distinguish a stable decision screen from a frame in the middle of a
+    -- Balatro transition.
+    state_complete = G.STATE_COMPLETE == true,
+    controller_locked = G.CONTROLLER and G.CONTROLLER.locked == true or false,
   }
 
   -- Basic game info
@@ -788,6 +794,12 @@ function gamestate.get_gamestate()
     state_data.cards = extract_area(G.deck)
   end
 
+  -- Cards already discarded this round/run. The compact Python prompt sorts
+  -- this composition, so it does not leak the hidden draw order.
+  if G.discard then
+    state_data.discard = extract_area(G.discard)
+  end
+
   -- Hand (count is 0 during not playing phase)
   if G.hand then
     state_data.hand = extract_area(G.hand)
@@ -812,6 +824,20 @@ function gamestate.get_gamestate()
   end
 
   return state_data
+end
+
+---Whether the game is ready to accept an action in the requested state.
+---@param expected_state integer?
+---@return boolean
+function gamestate.is_stable(expected_state)
+  if not G then
+    return false
+  end
+  if expected_state and G.STATE ~= expected_state then
+    return false
+  end
+  return G.STATE_COMPLETE == true
+    and (not G.CONTROLLER or G.CONTROLLER.locked ~= true)
 end
 
 -- ==========================================================================

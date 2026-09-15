@@ -13,6 +13,8 @@
 ---@field stake Stake? Current selected stake
 ---@field seed string? Seed used for the run
 ---@field state State Current game state
+---@field state_complete boolean? Whether the current state has finished loading
+---@field controller_locked boolean? Whether Balatro is currently blocking input
 ---@field round_num integer Current round number
 ---@field ante_num integer Current ante number
 ---@field money integer Current money amount
@@ -24,6 +26,7 @@
 ---@field consumables Area? Consumables area
 ---@field hand Area? Hand area (available during playing phase)
 ---@field cards Area? Cards remaining in deck (available during run)
+---@field discard Area? Cards already discarded (available during run)
 ---@field pack Area? Currently open pack (available during opeing pack phase)
 ---@field shop Area? Shop area (available during shop phase)
 ---@field vouchers Area? Vouchers area (available during shop phase)
