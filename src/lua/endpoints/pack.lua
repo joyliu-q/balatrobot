@@ -265,6 +265,28 @@ return {
         end
       end
 
+      -- Pack consumables are used immediately. Calling use_card directly
+      -- bypasses the UI's legality gate (e.g. Judgement at 5/5 joker slots).
+      -- Ask the game's own rules after targets have been highlighted, just
+      -- as the owned-consumable endpoint does. Do not gate playing cards or
+      -- Jokers with a consumable-only predicate.
+      if card.ability and card.ability.consumeable then
+        if not card:can_use_consumeable() then
+          send_response({
+            message = "Consumable '" .. (card.ability.name or card_key or "Unknown") .. "' cannot be used at this time",
+            name = BB_ERROR_NAMES.NOT_ALLOWED,
+          })
+          return true
+        end
+        if card:check_use() then
+          send_response({
+            message = "Cannot use consumable: insufficient space",
+            name = BB_ERROR_NAMES.NOT_ALLOWED,
+          })
+          return true
+        end
+      end
+
       -- Log what we're selecting
       local card_name = card.ability and card.ability.name or "Unknown"
       local card_set = card.ability and card.ability.set or card.set or "card"

@@ -320,6 +320,32 @@ end
 -- Card Extractor
 -- ==========================================================================
 
+-- These are the targets already visible on the joker this round, not RNG
+-- seeds or future outcomes. Never invoke a reset/random function while reading.
+local function extract_joker_scoring_state(card)
+  local key = card.config and (card.config.center_key or (card.config.center and card.config.center.key))
+  local target_keys = {
+    j_idol = "idol_card",
+    j_ancient = "ancient_card",
+    j_mail = "mail_card",
+    j_castle = "castle_card",
+  }
+  local target_key = target_keys[key]
+  local current_round = G and G.GAME and G.GAME.current_round
+  local target = target_key and current_round and current_round[target_key]
+  if type(target) ~= "table" then return nil end
+  local visible_target = {}
+  if target.suit then visible_target.suit = convert_suit_to_enum(target.suit) end
+  if target.rank then visible_target.rank = convert_rank_to_enum(tostring(target.rank)) end
+  if type(target.id) == "number" then visible_target.rank_id = target.id end
+  local result = { target = visible_target }
+  if key == "j_castle" and card.ability and type(card.ability.extra) == "table" then
+    result.chips = card.ability.extra.chips
+    result.chip_gain = card.ability.extra.chip_mod
+  end
+  return result
+end
+
 ---Extracts a complete Card object from a game card
 ---@param card table The game card object
 ---@return Card card The Card object
@@ -366,6 +392,7 @@ local function extract_card(card)
     modifier = extract_card_modifier(card),
     state = extract_card_state(card),
     cost = extract_card_cost(card),
+    scoring_state = extract_joker_scoring_state(card),
   }
 end
 

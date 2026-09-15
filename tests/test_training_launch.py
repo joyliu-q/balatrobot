@@ -119,16 +119,22 @@ def test_missing_checkpoint_does_not_read_manifests(launcher):
 def reward_helpers():
     source = Path(__file__).resolve().parents[1] / "batro_modal_rl.py"
     tree = ast.parse(source.read_text())
-    selected = {"_progress_value", "_transition_reward_parts"}
+    selected = {"_progress_value", "_transition_reward_parts", "_ante_clear_reward", "_episode_reward_parts"}
     module = ast.Module(body=[
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in selected
     ], type_ignores=[])
-    namespace = {"Any": object, "ANTE_CHECKPOINT_BONUS": 8.0}
+    namespace = {"Any": object}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            if node.targets[0].id in {"ANTE_CHECKPOINT_BONUS", "FINAL_ANTE", "DECISION_CAP_PENALTY"}:
+                namespace[node.targets[0].id] = ast.literal_eval(node.value)
     exec(compile(module, str(source), "exec"), namespace)
     return SimpleNamespace(
         progress=namespace["_progress_value"],
         transition=namespace["_transition_reward_parts"],
+        ante_reward=namespace["_ante_clear_reward"],
+        episode=namespace["_episode_reward_parts"],
     )
 
 
@@ -171,3 +177,51 @@ def test_skipped_blind_is_not_rewardable_progress(reward_helpers):
     assert parts["progress"] == 1.0
     assert parts["blind_clear_bonus"] == 3.0
     assert parts["ante_checkpoint_bonus"] == 8.0
+
+
+@pytest.mark.parametrize("ante", range(1, 9))
+def test_ante_reward_scales_by_cleared_ante(reward_helpers, ante):
+    parts = reward_helpers.transition(
+        {"ante_num": ante}, {"ante_num": ante + 1},
+        valid_action=True, highest_rewarded_ante=ante - 1,
+    )
+    assert parts["ante_checkpoint_bonus"] == 8.0 * ante
+    assert parts["ante_checkpoints"] == 1
+    assert parts["highest_rewarded_ante"] == ante
+
+
+def test_vouchers_cannot_repeat_ante_rewards(reward_helpers):
+    highest = 0
+    rewards, checkpoints = [], 0
+    antes = [1, 2, 3, 2, 3, 2, 3, 4]
+    for before, after in zip(antes, antes[1:]):
+        parts = reward_helpers.transition(
+            {"ante_num": before}, {"ante_num": after},
+            valid_action=True, highest_rewarded_ante=highest,
+        )
+        highest = parts["highest_rewarded_ante"]
+        rewards.append(parts["ante_checkpoint_bonus"])
+        checkpoints += parts["ante_checkpoints"]
+    assert rewards == [8, 16, 0, 0, 0, 0, 24]
+    assert highest == checkpoints == 3
+
+
+def test_win_top_up_uses_weighted_missing_antes_only(reward_helpers):
+    # Before the ante-8 boss: seven unique clears. A win may or may not
+    # advance the selector to ante 9; either path must total 8*(1+...+8).
+    assert reward_helpers.ante_reward(0, 7) == 224
+    assert reward_helpers.ante_reward(7, 8) == 64
+    assert reward_helpers.ante_reward(8, 8) == 0
+    for ante in (8, 9):
+        parts = reward_helpers.episode(
+            {"ante_num": ante, "won": True}, invalid_actions=0, turns=1, capped=False,
+        )
+        assert parts["ante_checkpoint_bonus"] == 288
+
+
+def test_multiple_new_antes_sum_their_individual_rewards(reward_helpers):
+    parts = reward_helpers.transition(
+        {"ante_num": 2}, {"ante_num": 5}, valid_action=True, highest_rewarded_ante=1,
+    )
+    assert parts["ante_checkpoint_bonus"] == 8 * (2 + 3 + 4)
+    assert parts["ante_checkpoints"] == 3

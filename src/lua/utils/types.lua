@@ -74,6 +74,12 @@
 ---@field modifier Card.Modifier Modifier information (seals, editions, enhancements)
 ---@field state Card.State Current state information (debuff, hidden, highlighted)
 ---@field cost Card.Cost Cost information (buy/sell prices)
+---@field scoring_state Card.ScoringState? Visible round-specific joker target/counters (never the RNG state)
+
+---@class Card.ScoringState
+---@field target {rank: string?, suit: string?, rank_id: integer?} The current round's already-selected target
+---@field chips number? Current Castle chips
+---@field chip_gain number? Castle chips gained per matching discarded card
 
 ---@class Card.Value
 ---@field suit Card.Value.Suit? Suit (Hearts, Diamonds, Clubs, Spades) - only for playing cards

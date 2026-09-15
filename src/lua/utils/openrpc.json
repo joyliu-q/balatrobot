@@ -1156,6 +1156,22 @@
           },
           "cost": {
             "$ref": "#/components/schemas/CardCost"
+          },
+          "scoring_state": {
+            "type": "object",
+            "description": "Already-visible round target for Idol, Ancient Joker, Mail-In Rebate or Castle; never RNG seeds or future outcomes.",
+            "properties": {
+              "target": {
+                "type": "object",
+                "properties": {
+                  "rank": { "$ref": "#/components/schemas/Rank" },
+                  "suit": { "$ref": "#/components/schemas/Suit" },
+                  "rank_id": { "type": "integer" }
+                }
+              },
+              "chips": { "type": "number" },
+              "chip_gain": { "type": "number" }
+            }
           }
         },
         "required": [

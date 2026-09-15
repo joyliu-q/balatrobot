@@ -558,8 +558,8 @@ def _get_env_pool() -> BalatroEnvironmentPool:
 # Agent prompt, action parsing, and episode reward
 # ---------------------------------------------------------------------------
 
-# A completed ante is a useful curriculum checkpoint, but winning ante 8 must
-# remain substantially more valuable than any collection of partial rewards.
+# Base for first-clear ante rewards: ante k pays k * this value. Re-clearing
+# an ante after a lowering voucher pays no additional ante checkpoint bonus.
 ANTE_CHECKPOINT_BONUS = 8.0
 FINAL_ANTE = 8
 # A complete action budget is evidence that the policy failed to finish the
@@ -664,6 +664,10 @@ def _compact_state(state: dict[str, Any], limit: int = 6_000) -> str:
             return {name: item for name, item in view.items() if item is not None}
 
         view = {"id": key, "effect": card.get("effect") or value.get("effect")}
+        # Already-visible round targets (Idol/Ancient/Mail/Castle), not RNG
+        # seeds. Keep these structured so replay scoring never guesses them.
+        if isinstance(card.get("scoring_state"), dict):
+            view["scoring_state"] = card["scoring_state"]
         if modifier:
             view["mod"] = modifier
         cost = card.get("cost")
@@ -1448,7 +1452,7 @@ def _episode_reward_parts(
     ante_checkpoints = max(0, ante - 1)
     if state.get("won"):
         ante_checkpoints = max(ante_checkpoints, FINAL_ANTE)
-    ante_checkpoint_bonus = float(ANTE_CHECKPOINT_BONUS * ante_checkpoints)
+    ante_checkpoint_bonus = _ante_clear_reward(0, ante_checkpoints)
     # Formatting a legal JSON action is a prerequisite, not game progress.
     # Rewarding it made repeatable no-op actions (notably rearrange) a policy
     # objective. Keep the metric field for dashboard compatibility at zero.
@@ -1525,12 +1529,18 @@ def _progress_value(state: dict[str, Any]) -> tuple[int, float]:
     return blinds_completed, fraction
 
 
+def _ante_clear_reward(previous_highest: int, highest: int) -> float:
+    """Pay N * ante once per newly cleared ante, not per selector crossing."""
+    return float(ANTE_CHECKPOINT_BONUS * sum(range(previous_highest + 1, highest + 1)))
+
+
 def _transition_reward_parts(
     previous_state: dict[str, Any],
     state: dict[str, Any],
     *,
     valid_action: bool,
     invalid_events: int = 0,
+    highest_rewarded_ante: int = 0,
 ) -> dict[str, float]:
     """Shape reward from one environment transition.
 
@@ -1557,8 +1567,12 @@ def _transition_reward_parts(
     blind_clear_delta = 3.0 if blind_defeated else 0.0
     previous_ante = max(1, int(previous_state.get("ante_num") or 1))
     ante = max(1, int(state.get("ante_num") or 1))
-    ante_checkpoints = max(0, ante - previous_ante)
-    ante_checkpoint_bonus = float(ANTE_CHECKPOINT_BONUS * ante_checkpoints)
+    # The caller carries this high-water mark across the whole episode. A
+    # Hieroglyph/Petroglyph purchase must not make an old ante rewardable again.
+    previous_highest = max(highest_rewarded_ante, previous_ante - 1)
+    highest = max(previous_highest, ante - 1)
+    ante_checkpoints = highest - previous_highest
+    ante_checkpoint_bonus = _ante_clear_reward(previous_highest, highest)
     # Legal syntax alone is not a rewardable transition.
     legal_bonus = 0.0
     invalid_penalty = -2.0 * max(0, int(invalid_events))
@@ -1567,6 +1581,7 @@ def _transition_reward_parts(
         "blind_clear_bonus": blind_clear_delta,
         "ante_checkpoint_bonus": ante_checkpoint_bonus,
         "ante_checkpoints": ante_checkpoints,
+        "highest_rewarded_ante": highest,
         "blind_clear_count": int(blind_defeated),
         "legal_action_bonus": legal_bonus,
         "invalid_penalty": invalid_penalty,
@@ -1926,6 +1941,7 @@ async def generate_balatro_episode(
         "invalid_penalty": 0.0,
     }
     ante_checkpoints = 0
+    highest_rewarded_ante = 0
     partial_reward_steps = 0
     # Keep checkpoint-window rewards separate from the episode accumulators.
     # A blind-clear event credits everything earned since the previous blind
@@ -2190,10 +2206,12 @@ async def generate_balatro_episode(
                     state,
                     valid_action=not invalid and not api_error,
                     invalid_events=int(invalid) + int(bool(api_error)),
+                    highest_rewarded_ante=highest_rewarded_ante,
                 )
                 for key in partial_reward_parts:
                     partial_reward_parts[key] += transition_rewards[key]
                 ante_checkpoints += int(transition_rewards["ante_checkpoints"])
+                highest_rewarded_ante = int(transition_rewards["highest_rewarded_ante"])
                 partial_reward_steps += 1
                 _add_pending(blind_reward_pending, transition_rewards)
                 _add_pending(ante_reward_pending, transition_rewards)
@@ -2286,9 +2304,10 @@ async def generate_balatro_episode(
     # double-counting if the environment has already advanced the ante.
     final_ante = max(1, int(state.get("ante_num") or 1))
     expected_checkpoints = min(FINAL_ANTE, final_ante)
-    if state.get("won") and ante_checkpoints < expected_checkpoints:
-        missing_checkpoints = expected_checkpoints - ante_checkpoints
-        checkpoint_reward = ANTE_CHECKPOINT_BONUS * missing_checkpoints
+    if state.get("won") and highest_rewarded_ante < expected_checkpoints:
+        missing_checkpoints = expected_checkpoints - highest_rewarded_ante
+        checkpoint_reward = _ante_clear_reward(highest_rewarded_ante, expected_checkpoints)
+        highest_rewarded_ante = expected_checkpoints
         partial_reward_parts["ante_checkpoint_bonus"] += checkpoint_reward
         ante_checkpoints += missing_checkpoints
         ante_reward_pending["ante_checkpoint_bonus"] += checkpoint_reward
@@ -2350,6 +2369,7 @@ async def generate_balatro_episode(
         "reward_checkpoint_events": len(partial_reward_trace),
         "ante_checkpoints": ante_checkpoints,
         "partial_reward_trace": partial_reward_trace,
+        "highest_rewarded_ante": highest_rewarded_ante,
         "final_ante": final_ante,
         "final_round": final_round,
         "won": won,
