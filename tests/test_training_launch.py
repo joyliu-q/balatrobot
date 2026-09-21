@@ -4,7 +4,7 @@ import ast
 import json
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -17,7 +17,7 @@ def launcher():
     tree = ast.parse(source.read_text())
     selected = {
         "_remaining_rollouts", "_launch_training", "_select_resume_checkpoint",
-        "_checkpoint_iteration",
+        "_checkpoint_iteration", "_validate_balatro_loss_config",
     }
     module = ast.Module(body=[
         node for node in tree.body
@@ -26,12 +26,14 @@ def launcher():
     pin = Mock()
     manifests = Mock(return_value={"shard": 100})
     checkpoints = Mock()
+    context = Mock(return_value=(49152, 8192))
     namespace = {
-        "TrainConfig": object, "TrainingRun": object, "Checkpoint": object,
-        "Path": Path, "json": json, "os": os, "re": re,
+        "TrainConfig": object, "TrainingRun": object, "Checkpoint": object, "Any": object,
+        "Path": Path, "PurePosixPath": PurePosixPath, "json": json, "os": os, "re": re,
         "_pin_resume_checkpoint": pin,
         "_checkpoint_manifest": manifests,
         "_checkpoint_manifest_health": Mock(return_value=(True, "complete")),
+        "_validate_balatro_context_config": context,
     }
     exec(compile(module, str(source), "exec"), namespace)
     return SimpleNamespace(
@@ -39,6 +41,7 @@ def launcher():
         launch=namespace["_launch_training"], pin=pin,
         select=namespace["_select_resume_checkpoint"],
         checkpoints=checkpoints, manifests=manifests,
+        context=context,
     )
 
 
@@ -62,7 +65,15 @@ def test_checkpoint_zero_is_also_exclusive(launcher):
 def test_receipt_prevents_duplicate_submission(launcher, tmp_path):
     receipt = tmp_path / "launch.json"
     run = SimpleNamespace(training_run_id="run", modal_app_id="app", function_call_id="fc")
-    config = SimpleNamespace(checkpoint="checkpoint", launch=Mock(return_value=run))
+    checkpoint = SimpleNamespace(path="/checkpoints/parent/iter_0000399")
+    recipe = SimpleNamespace(load="", no_load_optim=False, start_rollout_id=None,
+                             calculate_per_token_loss=False)
+    def submit():
+        assert recipe.load == "/checkpoints/parent"
+        assert recipe.no_load_optim is False
+        assert recipe.start_rollout_id is None
+        return run
+    config = SimpleNamespace(checkpoint=checkpoint, recipe=recipe, launch=Mock(side_effect=submit))
     assert launcher.launch(config, receipt) is run
     assert json.loads(receipt.read_text()) == {
         "state": "submitted", "training_run_id": "run",
@@ -71,13 +82,14 @@ def test_receipt_prevents_duplicate_submission(launcher, tmp_path):
     with pytest.raises(RuntimeError, match="No run submitted"):
         launcher.launch(config, receipt)
     config.launch.assert_called_once()
-    launcher.pin.assert_called_once_with("checkpoint")
+    launcher.pin.assert_called_once_with(checkpoint)
 
 
 @pytest.mark.parametrize("error", [RuntimeError("upload failed"), KeyboardInterrupt()])
 def test_interrupted_submission_is_not_retried(launcher, tmp_path, error):
     receipt = tmp_path / "launch.json"
-    config = SimpleNamespace(checkpoint=None, launch=Mock(side_effect=error))
+    config = SimpleNamespace(checkpoint=None, launch=Mock(side_effect=error),
+                             recipe=SimpleNamespace(calculate_per_token_loss=False))
     with pytest.raises(type(error)):
         launcher.launch(config, receipt)
     assert json.loads(receipt.read_text())["state"] == "submitting"
@@ -90,10 +102,40 @@ def test_interrupted_submission_is_not_retried(launcher, tmp_path, error):
 def test_partial_receipt_is_safe(launcher, tmp_path):
     receipt = tmp_path / "launch.json"
     receipt.touch()
-    config = SimpleNamespace(checkpoint=None, launch=Mock())
+    config = SimpleNamespace(checkpoint=None, launch=Mock(),
+                             recipe=SimpleNamespace(calculate_per_token_loss=False))
     with pytest.raises(RuntimeError, match="No run submitted"):
         launcher.launch(config, receipt)
     config.launch.assert_not_called()
+
+
+def test_context_clamp_rejected_before_submission(launcher, tmp_path):
+    launcher.context.side_effect = ValueError("context clamp")
+    receipt = tmp_path / "launch.json"
+    config = SimpleNamespace(recipe=SimpleNamespace(calculate_per_token_loss=False),
+                             checkpoint=object(), launch=Mock())
+    with pytest.raises(ValueError, match="context clamp"):
+        launcher.launch(config, receipt)
+    assert not receipt.exists()
+    launcher.pin.assert_not_called()
+    config.launch.assert_not_called()
+
+
+@pytest.mark.parametrize("recipe", [
+    SimpleNamespace(calculate_per_token_loss=True),
+    SimpleNamespace(),
+    SimpleNamespace(calculate_per_token_loss=None),
+    SimpleNamespace(calculate_per_token_loss=False,
+                    extra_config={"calculate_per_token_loss": True}),
+])
+def test_incompatible_loss_fails_before_any_launch_side_effect(launcher, tmp_path, recipe):
+    receipt = tmp_path / "launch.json"
+    config = SimpleNamespace(recipe=recipe, checkpoint=object(), launch=Mock())
+    with pytest.raises(ValueError, match="calculate_per_token_loss=False"):
+        launcher.launch(config, receipt)
+    assert not receipt.exists()
+    config.launch.assert_not_called()
+    launcher.pin.assert_not_called()
 
 
 @pytest.mark.parametrize("requested", [None, 199])

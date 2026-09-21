@@ -9,6 +9,13 @@
 -- ==========================================================================
 
 ---@class GameState
+---@field snapshot_version integer? Context-reset state schema version
+---@field owned_cards Area? Full owned composition; anonymous IDs, no draw order
+---@field joker_inventory Area? Known unordered joker composition when slots are hidden
+---@field run_state table? Observable run/round counters and previous action facts
+---@field blind_state table? Current blind restrictions and hand history
+---@field tags table[]? Pending/active tags with visible effects and targets
+---@field pack_choices integer? Selections remaining in the open pack
 ---@field deck Deck? Current selected deck
 ---@field stake Stake? Current selected stake
 ---@field seed string? Seed used for the run
@@ -75,6 +82,7 @@
 ---@field state Card.State Current state information (debuff, hidden, highlighted)
 ---@field cost Card.Cost Cost information (buy/sell prices)
 ---@field scoring_state Card.ScoringState? Visible round-specific joker target/counters (never the RNG state)
+---@field counters table? Visible persistent bonuses and per-card mechanic counters
 
 ---@class Card.ScoringState
 ---@field target {rank: string?, suit: string?, rank_id: integer?} The current round's already-selected target
