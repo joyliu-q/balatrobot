@@ -2058,6 +2058,54 @@ class Hand {
     return null;
   }
 
+  function gameReplay(sample, samples, trajectory = []) {
+    const episodeId = (part) => part?.metadata?.balatro?.episode_id
+      ?? part?.metadata?.rollout_id ?? part?.rollout_index;
+    const id = episodeId(sample);
+    const candidates = id == null ? [sample] : [sample, ...(Array.isArray(samples) ? samples : [])]
+      .filter(part => part && String(episodeId(part)) === String(id));
+    const parts = [...new Map(candidates.filter(Boolean).map(part => [part.metadata?.segment_id ?? 0, part])).values()]
+      .sort((a, b) => (a.metadata?.segment_id ?? 0) - (b.metadata?.segment_id ?? 0));
+    if (!parts.length) parts.push(null);
+    const result = { initial: null, states: [], actions: [], inputs: [], turns: [],
+      segments: parts.length, expectedSegments: sample?.metadata?.segment_count ?? parts.length,
+      finalAnte: sample?.metadata?.balatro?.final_ante ?? sample?.metadata?.['balatro/final_ante'],
+      missingResults: 0 };
+    let pending = null;
+    for (const part of parts) {
+      const messages = typeof part?.response === 'string' && part.response.length
+        ? [{ content: part.response }]
+        : part?.metadata?.trajectory_messages || (part === sample || part == null ? trajectory : []);
+      const snapshot = initialStateFrom(Array.isArray(part?.prompt) ? part.prompt : [{ content: part?.prompt }])
+        || initialStateFrom(messages) || (part === sample ? initialStateFrom(trajectory) : null);
+      const start = part?.metadata?.segment_turn_start;
+      // A rebase moves the preceding action's result into the next prompt.
+      // Use that complete snapshot, without inheriting stale fields across it.
+      if (pending && snapshot && start === pending.turn + 1) {
+        result.states.push(snapshot); result.actions.push(pending.action);
+        result.inputs.push(pending.before); result.turns.push(pending.turn);
+        result.missingResults -= 1;
+      }
+      pending = null;
+      if (!result.initial) result.initial = snapshot;
+      const states = statesFrom(messages, snapshot);
+      const actions = actionsFrom(messages);
+      states.forEach((state, index) => {
+        result.states.push(state); result.actions.push(actions[index] || null);
+        result.inputs.push(index ? states[index - 1] : snapshot);
+        result.turns.push((start ?? 1) + index);
+      });
+      if (actions.length > states.length) {
+        result.missingResults += actions.length - states.length;
+        if (actions.length === states.length + 1 && start != null) {
+          pending = { action: actions.at(-1), before: states.at(-1) || snapshot,
+            turn: start + actions.length - 1 };
+        }
+      }
+    }
+    return result;
+  }
+
   function selectedBlind(state) {
     const blinds = state?.blinds;
     if (!blinds || typeof blinds !== "object" || Array.isArray(blinds)) return null;
@@ -2301,18 +2349,10 @@ class Hand {
     }
   }
 
-  let stateMessages = $derived(
-    text(sample?.response).includes("<balatro_state>")
-      ? [{ role: "assistant", content: sample.response }]
-      : trajectory,
-  );
-  let initialState = $derived(
-    initialStateFrom(trajectory)
-      || initialStateFrom(Array.isArray(sample?.prompt) ? sample.prompt : [{ content: sample?.prompt }])
-      || initialStateFrom(stateMessages),
-  );
-  let states = $derived(statesFrom(stateMessages, initialState));
-  let actions = $derived(actionsFrom(stateMessages));
+  let replay = $derived(gameReplay(sample, samples, trajectory));
+  let initialState = $derived(replay.initial);
+  let states = $derived(replay.states);
+  let actions = $derived(replay.actions);
   let groups = $derived.by(() => {
     const result = [];
     const frames = states.map((state, index) => ({ state, index }));
@@ -2334,6 +2374,11 @@ class Hand {
   });
   let activeGroupIndex = $state(0);
   let activeFrameIndex = $state(0);
+  let navigationKey = $derived(sample?.metadata?.balatro?.episode_id
+    ?? sample?.metadata?.rollout_id ?? sample?.rollout_index ?? sample ?? trajectory);
+  $effect(() => {
+    if (navigationKey != null) { activeGroupIndex = 0; activeFrameIndex = 0; }
+  });
   let activeGroup = $derived(groups[activeGroupIndex] || groups.at(-1) || null);
   let activeFrame = $derived(activeGroup?.frames[Math.min(activeFrameIndex, Math.max(activeGroup.frames.length - 1, 0))] || null);
   let latest = $derived(activeFrame?.state || states.at(-1) || {});
@@ -2346,7 +2391,7 @@ class Hand {
       ? Object.entries(latest.blinds || {}).map(([id, blind]) => ({ id, ...blind })) : [],
   );
   let activeAction = $derived(actions[activeFrame?.index ?? -1] || null);
-  let previousState = $derived(activeFrame?.index > 0 ? states[activeFrame.index - 1] : initialState);
+  let previousState = $derived(replay.inputs[activeFrame?.index] || initialState);
   let selectedIndices = $derived(
     activeAction && ["play", "discard", "use"].includes(activeAction.method) && Array.isArray(activeAction.params?.cards)
       ? activeAction.params.cards
@@ -2568,10 +2613,12 @@ class Hand {
 
   <header class="viewer-header">
     <div class="replay-brand"><b>BALATRO</b><small>TRAJECTORY REPLAY · READ ONLY</small></div>
-    <div class="replay-meta">{states.length} turns · {groups.length} phase groups · {Array.isArray(samples) ? samples.length : 0} samples</div>
+    <div class="replay-meta">{states.length} recorded moves · {groups.length} phase groups{#if replay.finalAnte != null} · Final ante {replay.finalAnte}{/if}</div>
     <span class="run-badge">{latest.phase || run?.status || "RUN"}</span>
   </header>
   {#if activeGroup}
+    {#if replay.segments < replay.expectedSegments}<p class="replay-notice">Partial replay: {replay.segments} of {replay.expectedSegments} game segments available.</p>{/if}
+    {#if replay.missingResults}<p class="replay-notice">{replay.missingResults} move result{replay.missingResults === 1 ? " was" : "s were"} not saved. Showing recorded states only.</p>{/if}
     <nav class="blind-strip" aria-label="Ante, round, and blind">
       {#each groups as group, index}
         <button aria-current={index === activeGroupIndex ? "step" : undefined} class:active={index === activeGroupIndex} class="blind-tab" onclick={() => selectGroup(index)}>
@@ -2583,12 +2630,14 @@ class Hand {
 
 
       <div class="turn-strip replay-controls" aria-label="Turns in selected blind">
+        <button type="button" onclick={() => seekFrame(0)}>Start</button>
         <button type="button" aria-label="Previous frame" disabled={framePosition === 0} onclick={() => seekFrame(framePosition - 1)}>◀</button>
         <span>{activeGroup.frames.length} turns</span>
         {#each activeGroup.frames as frame, index}
-          <button class:active={index === activeFrameIndex} class="turn-dot" title={frame.index < 0 ? "Initial state · before any action" : `turn ${frame.index + 1}`} onclick={() => (activeFrameIndex = index)}>{frame.index < 0 ? "S" : frame.index + 1}</button>
+          <button class:active={index === activeFrameIndex} class="turn-dot" title={frame.index < 0 ? "Initial state · before any action" : `turn ${replay.turns[frame.index]}`} onclick={() => (activeFrameIndex = index)}>{frame.index < 0 ? "S" : replay.turns[frame.index]}</button>
         {/each}
         <button type="button" aria-label="Next frame" disabled={framePosition >= flatFrames.length - 1} onclick={() => seekFrame(framePosition + 1)}>▶</button>
+        <button type="button" onclick={() => seekFrame(flatFrames.length - 1)}>Last recorded frame</button>
       </div>
     <div class="game-layout">
       <aside class="game-hud" aria-label="Recorded game status">
@@ -2618,7 +2667,7 @@ class Hand {
           <div class="hands-resource"><small>Hands left</small><strong>{progress && !progress.pending ? latest.blind?.hands ?? "—" : "—"}</strong></div>
           <div class="discards-resource"><small>Discards left</small><strong>{progress && !progress.pending ? latest.blind?.discards ?? "—" : "—"}</strong></div>
           <div class="money-resource"><small>Cash</small><strong>{latest.money != null ? "$" + latest.money : "—"}</strong></div>
-          <div><small>Ante</small><strong>{latest.ante ?? "—"}<em>/8</em></strong></div>
+          <div><small>Current ante</small><strong>{latest.ante ?? "—"}<em>/8</em></strong></div>
           <div><small>Round</small><strong>{latest.round ?? "—"}</strong></div>
         </div>
         {#if enteredNewAnte}<p class="ante-note">{anteLabel}</p>{/if}
@@ -2825,6 +2874,7 @@ class Hand {
   .viewer-header { display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: #273337; border-radius: 7px 7px 0 0; }
   .replay-brand { display: flex; align-items: baseline; gap: 10px; } .replay-brand b { font-size: 23px; letter-spacing: 2px; font-weight: normal; } .replay-brand small, .replay-meta { color: #b6c5c9; font-size: 12px; }
   .replay-meta { margin-left: auto; } .run-badge { color: #f6c763; text-transform: uppercase; font-size: 14px; }
+  .replay-notice { margin: 0; padding: 8px 12px; color: #f6c763; font-size: 13px; }
   .replay-controls { display: flex; align-items: center; gap: 9px; padding: 8px 12px; background: #303e43; border-bottom: 2px solid #263338; }
   .replay-controls button, .inspector-heading button { border: 0; border-radius: 4px; color: #fff; background: #59696e; padding: 5px 10px; }
   .game-layout { display: grid; grid-template-columns: 182px minmax(0, 1fr); }

@@ -8,7 +8,7 @@ import test from "node:test";
 
 // Use the dashboard's installed Svelte, without a second package/install in
 // the game repository. Override for checkouts with a different directory name.
-const frontend = process.env.TRAINING_GYM_FRONTEND || fileURLToPath(new URL("../../training-gym/dashboards/frontend", import.meta.url));
+const frontend = process.env.MODAL_DOJO_FRONTEND || fileURLToPath(new URL("../../modal-dojo/dashboards/frontend", import.meta.url));
 const require = createRequire(resolve(frontend, "package.json"));
 const { compile } = require("svelte/compiler");
 const { render } = await import(pathToFileURL(require.resolve("svelte/server")));
@@ -16,7 +16,67 @@ const source = readFileSync(new URL("./TrajectoryViewer.svelte", import.meta.url
 const compiled = compile(source, { generate: "server", filename: "TrajectoryViewer.svelte" });
 const code = compiled.js.code.replace(/from '(svelte[^']*)'/g, (_, id) => `from '${pathToFileURL(require.resolve(id))}'`);
 const { default: Viewer } = await import(`data:text/javascript;base64,${Buffer.from(code).toString("base64")}`);
-const helpers = new Function(`${source.slice(source.indexOf("  // Sprite coordinates"), source.indexOf("  let stateMessages"))}; return { chipProgress, chips, statesFrom, actionsFrom, spriteVisual, modifierBadges, JOKER_SPRITES, CARD_ATLASES, calculateHand, calculatorJokers, calculatorCard, upstreamCalculator };`)();
+const helpers = new Function(`${source.slice(source.indexOf("  // Sprite coordinates"), source.indexOf("  let replay ="))}; return { gameReplay, chipProgress, chips, statesFrom, actionsFrom, spriteVisual, modifierBadges, JOKER_SPRITES, CARD_ATLASES, calculateHand, calculatorJokers, calculatorCard, upstreamCalculator };`)();
+
+test("game replay joins ordered segments and recovers boundary results from full snapshots", () => {
+  const first = { metadata: { balatro: { episode_id: 42, final_ante: 5 }, segment_id: 0, segment_count: 2, segment_turn_start: 1 },
+    prompt: 'Gamestate: {"ante":1,"phase":"hand","shop":["stale"],"hand":["S_A"]}',
+    response: '{"method":"select","params":{}}<balatro_state>{"round":1}</balatro_state>{"method":"play","params":{"cards":[0]}}' };
+  const second = { metadata: { balatro: { episode_id: 42, final_ante: 5 }, segment_id: 1, segment_count: 2, segment_turn_start: 3 },
+    prompt: 'Gamestate: {"ante":5,"phase":"hand","hand":["H_K"]}',
+    response: '{"method":"play","params":{"cards":[0]}}<balatro_state>{"phase":"GAME_OVER"}</balatro_state>' };
+  const unrelated = { ...second, metadata: { ...second.metadata, balatro: { episode_id: 99 } } };
+  const replay = helpers.gameReplay(first, [second, unrelated, first, second]);
+  assert.deepEqual(replay.states.map(s => s.ante), [1, 5, 5]);
+  assert.deepEqual(replay.actions.map(a => a.method), ["select", "play", "play"]);
+  assert.deepEqual(replay.turns, [1, 2, 3]);
+  assert.deepEqual(replay.inputs[1].hand, ["S_A"]);
+  assert.deepEqual(replay.inputs[2].hand, ["H_K"]);
+  assert.equal(replay.states[1].shop, undefined, "full snapshot must discard stale fields");
+  assert.equal(replay.missingResults, 0);
+  assert.equal(replay.segments, 2);
+  const html = render(Viewer, { props: { sample: first, samples: [second, first] } }).body;
+  for (const label of ["Final ante 5", "ante 5", "Last recorded frame", "3 recorded moves"]) assert.ok(html.includes(label), label);
+  assert.deepEqual(helpers.gameReplay(second, [first, second]).states, replay.states);
+});
+
+test("missing segments and unsaved final results are disclosed without inventing states", () => {
+  const sample = { metadata: { balatro: { episode_id: 42, final_ante: 5 }, segment_id: 0, segment_count: 3, segment_turn_start: 1 },
+    prompt: 'Gamestate: {"ante":1}',
+    response: '{"method":"select","params":{}}<balatro_state>{"phase":"hand"}</balatro_state>{"method":"play","params":{"cards":[0]}}' };
+  const later = { ...sample, metadata: { ...sample.metadata, segment_id: 2, segment_turn_start: 10 }, prompt: 'Gamestate: {"ante":5}' };
+  const replay = helpers.gameReplay(sample, [later, sample]);
+  assert.deepEqual(replay.turns, [1, 10]);
+  assert.equal(replay.missingResults, 2);
+  const html = render(Viewer, { props: { sample, samples: [sample] } }).body;
+  assert.ok(html.includes("Partial replay: 1 of 3 game segments available."));
+  assert.ok(html.includes("1 move result was not saved."));
+});
+
+test("recorded ante-five game replays all 15 segments through move 136", () => {
+  // Reduced state fields from independent-slab rollout 0, episode
+  // 1789759001521903355. Its final action (137) has no saved result.
+  const parts = JSON.parse(readFileSync(new URL("./fixtures/ante-five-segments.json", import.meta.url), "utf8"));
+  const replay = helpers.gameReplay(parts[0], [...parts].reverse());
+  assert.equal(replay.initial.ante, 1);
+  assert.equal(replay.states.length, 136);
+  assert.deepEqual(replay.turns, Array.from({ length: 136 }, (_, i) => i + 1));
+  assert.equal(replay.states.at(-1).ante, 5);
+  assert.deepEqual([...new Set(replay.states.map(s => s.ante))], [1, 2, 3, 4, 5]);
+  assert.equal(replay.missingResults, 1);
+  assert.equal(replay.segments, 15);
+  for (let i = 1; i < parts.length; i++) {
+    const boundary = parts[i].metadata.segment_turn_start - 2;
+    const snapshot = JSON.parse(parts[i].prompt.slice('Gamestate: '.length));
+    assert.deepEqual(replay.states[boundary], snapshot);
+    assert.deepEqual(replay.inputs[boundary + 1], snapshot);
+  }
+  const html = render(Viewer, { props: { sample: parts[0], samples: parts } }).body;
+  for (const ante of [1, 2, 3, 4, 5]) assert.ok(html.includes(`ante ${ante}`));
+  assert.ok(html.includes("136 recorded moves"));
+  assert.ok(html.includes("Final ante 5"));
+  assert.ok(!html.includes("Partial replay"));
+});
 
 const blinds = {
   small: { name: "Small Blind", type: "small", status: "SELECT", score: 300, tag: "Investment Tag", tag_effect: "After defeating the Boss Blind, gain $25." },

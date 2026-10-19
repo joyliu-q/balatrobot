@@ -1,11 +1,11 @@
-"""Train a Balatro policy with Training Gym and one Modal Sandbox per game.
+"""Train a Balatro policy with Modal Dojo and one Modal Sandbox per game.
 
 The macOS ``Balatro.love`` archive is platform independent, but the executable
 is not. This file uploads the private game assets to a Modal Volume and runs
 them with the official Linux LOVE 11.5 build. Each rollout gets its own
 Sandbox, so concurrent games never share a Balatro process or save directory.
 
-Safe workflow (from the Training Gym Python 3.12 environment)::
+Safe workflow (from the Modal Dojo Python 3.12 environment)::
 
     python batro_modal_rl.py --prepare-assets
     python batro_modal_rl.py --smoke-env
@@ -33,7 +33,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import modal
-from modal_training_gym import (
+from modal_dojo import (
     DatasetConfig,
     Qwen3_8_27B,
     Qwen3_8_27B_Recipe as BaseQwen3_8_27B_Recipe,
@@ -43,15 +43,15 @@ from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass as recipe_dataclass
 
 try:
-    from modal_training_gym import DashboardComponent
+    from modal_dojo import DashboardComponent
 except ImportError:
-    # Dashboard components were added after the core Training Gym launch API.
+    # Dashboard components were added after the core Modal Dojo launch API.
     # Keep the training entrypoint usable with compatible older clients.
     DashboardComponent = None
 
-from modal_training_gym.common.checkpoint import Checkpoint, _list_checkpoints
-from modal_training_gym.common.models.base import ToolCall
-from modal_training_gym.common.run import TrainingRun, set_checkpoint_location
+from modal_dojo.common.checkpoint import Checkpoint, _list_checkpoints
+from modal_dojo.common.models.base import ToolCall
+from modal_dojo.common.run import TrainingRun, set_checkpoint_location
 
 # ---------------------------------------------------------------------------
 # Private assets: local Mac -> private Modal Volume
@@ -340,7 +340,7 @@ TERMINAL_STATES = frozenset({"GAME_OVER"})
 
 @dataclass
 class Observation:
-    """Balatro tool feedback, independent of unpublished Training Gym APIs."""
+    """Balatro tool feedback, independent of unpublished Modal Dojo APIs."""
 
     text: str = ""
     is_error: bool = False
@@ -484,7 +484,7 @@ class BalatroSandboxEnvironment(SandboxEnvironment):
         return self.settle(state)
 
     def screenshot_data_uri(self) -> str:
-        """Capture the current game frame for Training Gym's rollout viewer."""
+        """Capture the current game frame for Modal Dojo's rollout viewer."""
         path = f"/tmp/balatro-rollout-{time.time_ns()}.png"
         self.rpc("screenshot", {"path": path})
         process = self.sandbox.exec("base64", "-w", "0", path, timeout=15)
@@ -639,7 +639,11 @@ BALATRO_SYSTEM_PROMPT = (
     "Play Balatro through the provided JSON action interface. Choose exactly "
     "one legal API action and return only minified JSON: "
     '{"method":"name","params":{...}}. Card and item indices are 0-based; '
-    "every index in a list must be distinct. State uses "
+    "every index in a list must be distinct. "
+    "End your response immediately after that one object. Extra objects, prose, "
+    "or hitting the output limit reject the entire response without executing it. "
+    '"buy", "sell", "use", and "pack" take scalar item indices, e.g. '
+    '{"method":"buy","params":{"pack":0}}; only cards/targets take lists. State uses '
     "hand_stats=[level,total_played,played_this_round]. After the first "
     "turn, balatro_state contains only fields changed since the previous "
     "turn; absent fields are unchanged and null means removed. Each new "
@@ -1108,6 +1112,24 @@ def _consumable_requires_joker(item: Any) -> bool:
     )
 
 
+def _consumable_available(item: Any, compact: dict[str, Any]) -> bool:
+    """Shared visible-state gate for advertised and accepted consumable uses.
+
+    Creating a Joker is different from requiring an existing Joker (Ankh).
+    Apply the same capacity rule to owned consumables and immediate pack uses.
+    Target-card bounds are checked separately because they depend on the action.
+    """
+    if not isinstance(item, dict):
+        return True
+    jokers = _area_items(compact, "jokers")
+    if _consumable_requires_joker(item) and not jokers:
+        return False
+    if item.get("id") in {"c_judgement", "c_soul", "c_wraith"}:
+        used, limit = _slot_usage(compact, "jokers")
+        return used < limit
+    return True
+
+
 def _target_action_help(
     *, method: str, item_name: str, index: int, item: Any, hand_size: int
 ) -> str | None:
@@ -1177,14 +1199,14 @@ def _action_help(state: dict[str, Any]) -> str:
             actions.append(
                 f"discard cards=1-5 distinct indices in 0..{high} ({discards} left)"
             )
-        if jokers:
-            actions.append(f"sell joker=0..{len(jokers) - 1}")
+        if sellable := _sellable_indices(compact, "jokers"):
+            actions.append(f"sell joker=one of {sellable}")
         if consumables:
             actions.append(f"sell consumable=0..{len(consumables) - 1}")
             actions.extend(
                 help_text
                 for index, item in enumerate(consumables)
-                if (not _consumable_requires_joker(item) or jokers)
+                if _consumable_available(item, compact)
                 and (
                     help_text := _target_action_help(
                         method="use",
@@ -1209,14 +1231,14 @@ def _action_help(state: dict[str, Any]) -> str:
         reroll_cost = float(compact.get("reroll_cost") or 0)
         if reroll_cost > 0 and float(compact.get("money") or 0) >= reroll_cost:
             actions.append(f"reroll (cost {reroll_cost:g})")
-        if jokers:
-            actions.append(f"sell joker=0..{len(jokers) - 1}")
+        if sellable := _sellable_indices(compact, "jokers"):
+            actions.append(f"sell joker=one of {sellable}")
         if consumables:
             actions.append(f"sell consumable=0..{len(consumables) - 1}")
             actions.extend(
                 help_text
                 for index, item in enumerate(consumables)
-                if (not _consumable_requires_joker(item) or jokers)
+                if _consumable_available(item, compact)
                 and _consumable_target_bounds(item) is None
                 and (
                     help_text := _target_action_help(
@@ -1241,11 +1263,7 @@ def _action_help(state: dict[str, Any]) -> str:
                 and str(item.get("id") or "").startswith("j_")
                 and jokers_used >= jokers_limit
             )
-            and not (
-                isinstance(item, dict)
-                and str(item.get("id") or "") == "c_ankh"
-                and jokers_used == 0
-            )
+            and _consumable_available(item, compact)
         ]
         actions = ["pack skip=true"]
         for kind, name in (("joker", "jokers"), ("consumable", "consumables")):
@@ -1311,11 +1329,11 @@ def _action_is_locally_legal(action: ToolCall, state: dict[str, Any]) -> bool:
     state_name = str(state.get("state", ""))
 
     def valid_indices(value: Any, size: int, *, complete: bool = False) -> bool:
-        if not isinstance(value, list) or not value or len(value) != len(set(value)):
+        if not isinstance(value, list) or not value:
             return False
-        if any(not isinstance(index, int) or not 0 <= index < size for index in value):
+        if any(type(index) is not int or not 0 <= index < size for index in value):
             return False
-        return not complete or sorted(value) == list(range(size))
+        return len(value) == len(set(value)) and (not complete or sorted(value) == list(range(size)))
 
     hand = compact.get("hand") if isinstance(compact.get("hand"), list) else []
     jokers = _area_items(compact, "jokers")
@@ -1342,7 +1360,7 @@ def _action_is_locally_legal(action: ToolCall, state: dict[str, Any]) -> bool:
         return method == "select" or str(selected.get("type") or "").upper() != "BOSS"
 
     def valid_targets(key: str, item: Any) -> bool:
-        if _consumable_requires_joker(item) and not jokers:
+        if not _consumable_available(item, compact):
             return False
         bounds = _consumable_target_bounds(item)
         if bounds is None:
@@ -1379,7 +1397,7 @@ def _action_is_locally_legal(action: ToolCall, state: dict[str, Any]) -> bool:
         if set(params) - {"consumable", "cards"}:
             return False
         index = params.get("consumable")
-        if not isinstance(index, int) or not 0 <= index < len(consumables):
+        if type(index) is not int or not 0 <= index < len(consumables):
             return False
         if _consumable_target_bounds(consumables[index]) is not None:
             if str(state.get("state", "")) != "SELECTING_HAND":
@@ -1415,7 +1433,7 @@ def _action_is_locally_legal(action: ToolCall, state: dict[str, Any]) -> bool:
             return False
         index = params.get("card")
         pack = compact.get("pack") if isinstance(compact.get("pack"), list) else []
-        if not isinstance(index, int) or not 0 <= index < len(pack):
+        if type(index) is not int or not 0 <= index < len(pack):
             return False
         item = pack[index]
         jokers_used, jokers_limit = _slot_usage(compact, "jokers")
@@ -1435,34 +1453,71 @@ def _action_is_locally_legal(action: ToolCall, state: dict[str, Any]) -> bool:
     return False
 
 
-def _decode_action(text: str | None, state: dict[str, Any]) -> ToolCall | None:
-    """Decode the first model JSON action allowed in the current phase.
+def _unique_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON key")
+        result[key] = value
+    return result
 
-    This deliberately does not enforce index legality; callers can distinguish
-    malformed-but-repairable model output from output that needs the emergency
-    fallback action.
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"Non-JSON constant: {value}")
+
+
+def _single_action_object(text: str | None) -> dict[str, Any] | None:
+    """Consume the entire response, allowing only whitespace and one terminal EOS.
+
+    Qwen's decoded text may include its sampled end-of-turn token. Removing
+    that suffix for validation never changes the sampled training IDs/logprobs.
     """
     if not text:
         return None
-    state_name = str(state.get("state", ""))
-    candidate = text.strip().removeprefix("```json").removeprefix("```")
-    candidate = candidate.removesuffix("```").strip()
-    for match in re.finditer(r"\{", candidate):
+    candidate = text.strip().removesuffix("<|im_end|>").strip()
+    try:
+        value = json.loads(candidate, object_pairs_hook=_unique_json_keys,
+                           parse_constant=_reject_json_constant)
+    except (ValueError, RecursionError):
+        return None
+    if (not isinstance(value, dict) or set(value) != {"method", "params"}
+            or not isinstance(value["method"], str) or not isinstance(value["params"], dict)):
+        return None
+    return value
+
+
+def _action_object_count(text: str) -> int:
+    """Diagnostic only: count complete action objects, never select one to run."""
+    count = 0
+    consumed = 0
+    for match in re.finditer(r"\{", text):
+        if match.start() < consumed:
+            continue
         try:
-            value, _ = json.JSONDecoder().raw_decode(candidate[match.start() :])
-        except json.JSONDecodeError:
+            value, end = json.JSONDecoder().raw_decode(text[match.start():])
+        except (ValueError, RecursionError):
             continue
-        if not isinstance(value, dict):
-            continue
-        method, params = value.get("method"), value.get("params", {})
-        if method not in _ALLOWED_METHODS.get(state_name, set()):
-            continue
-        if not isinstance(params, dict):
-            continue
-        params = dict(params)
-        params.pop("reasoning", None)
-        return ToolCall(name=method, arguments=params)
-    return None
+        consumed = match.start() + end
+        count += isinstance(value, dict) and "method" in value
+    return count
+
+
+def _action_output_error(text: str, finish: str) -> str:
+    if finish == "length":
+        return "length_limit"
+    if finish != "stop":
+        return "abnormal_finish"
+    if _single_action_object(text) is None:
+        return "invalid_format"
+    return ""
+
+
+def _decode_action(text: str | None, state: dict[str, Any]) -> ToolCall | None:
+    """Accept one whole JSON action, without repairing or ignoring any suffix."""
+    value = _single_action_object(text)
+    if value is None or value["method"] not in _ALLOWED_METHODS.get(str(state.get("state", "")), set()):
+        return None
+    return ToolCall(name=value["method"], arguments=value["params"])
 
 
 def _parse_action(text: str | None, state: dict[str, Any]) -> ToolCall | None:
@@ -1748,11 +1803,45 @@ def _tokenizer(checkpoint: str) -> Any:
     return _TOKENIZERS[checkpoint]
 
 
-def _chat_prompt(tokenizer: Any, user_message: str) -> str:
+def _thinking_budget(args: Any) -> int:
+    budget = getattr(args, "balatro_thinking_budget", 0)
+    if type(budget) is not int or budget not in (0, 8192):
+        raise ValueError("balatro_thinking_budget must be 0 or 8192")
+    return budget
+
+
+def _thinking_action_text(text: str, enabled: bool) -> str | None:
+    """Only the final answer is an action; reasoning is retained for training."""
+    if not enabled:
+        return text
+    if text.count("</think>") != 1 or "<think>" in text:
+        return None
+    reasoning, answer = text.split("</think>")
+    if "<|im_end|>" in reasoning or "<|im_start|>" in text:
+        return None
+    return answer
+
+
+def _balatro_system_prompt(thinking: bool = False) -> str:
+    if not thinking:
+        return BALATRO_SYSTEM_PROMPT
+    return BALATRO_SYSTEM_PROMPT.replace(
+        "one legal API action and return only minified JSON:",
+        "one legal API action. Think within the open thinking block for at most "
+        "8192 tokens. End thinking with </think>; if the budget is reached, the "
+        "harness closes the block. Then return only minified JSON:",
+    ).replace("Extra objects, prose,", "Extra objects or prose in the final answer,").replace(
+        "or hitting the output limit", "or hitting the final-answer output limit",
+    )
+
+
+def _chat_prompt(tokenizer: Any, user_message: str, *, thinking: bool = False) -> str:
+    if thinking:
+        user_message = user_message.replace("with no markdown or reasoning.", "with no markdown or reasoning in the final answer.")
     messages = [
         {
             "role": "system",
-            "content": BALATRO_SYSTEM_PROMPT,
+            "content": _balatro_system_prompt(thinking),
         },
         {"role": "user", "content": user_message},
     ]
@@ -1761,12 +1850,100 @@ def _chat_prompt(tokenizer: Any, user_message: str) -> str:
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
+            enable_thinking=thinking,
         )
     except TypeError:
+        if thinking:
+            raise ValueError("Tokenizer must support enable_thinking for thinking runs")
         return tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+
+
+def _feedback_chat_turn(tokenizer: Any, feedback: str, *, assistant_ended: bool, thinking: bool = False) -> str:
+    """Frame every next decision like the fresh-snapshot assistant turn.
+
+    Only append template/control tokens; never retokenize sampled action IDs.
+    A length-limited answer needs a masked end-of-turn marker before feedback.
+    """
+    messages = [{"role": "user", "content": feedback}]
+    try:
+        turn = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=thinking,
+        )
+    except TypeError:
+        if thinking:
+            raise ValueError("Tokenizer must support enable_thinking for thinking runs")
+        turn = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    complete = _chat_prompt(tokenizer, feedback, thinking=thinking)
+    if thinking and not complete.endswith(turn):
+        # Qwen's thinking template adds a default reasoning-effort system
+        # message to a user-only render. Keep its user/assistant suffix and
+        # verify it against the full explicit-system render below. This model
+        # uses ChatML; unsupported framing still fails rather than guessing.
+        user_start = turn.find("<|im_start|>user\n")
+        if user_start >= 0:
+            turn = turn[user_start:]
+    if not turn or not complete.endswith(turn) or not tokenizer.eos_token:
+        raise ValueError("Tokenizer cannot frame a Balatro feedback turn consistently")
+    return ("" if assistant_ended else tokenizer.eos_token) + "\n" + turn
+
+
+def _validate_balatro_sampling_params(params: dict[str, Any], *, evaluation: bool = False) -> None:
+    """Require the same unmasked distribution the trainer optimizes."""
+    if not isinstance(params, dict):
+        raise ValueError("sampling_params must be a dictionary")
+    for constraint in ("regex", "json_schema", "ebnf"):
+        if params.get(constraint) is not None:
+            raise ValueError(
+                f"Balatro training cannot use {constraint}: the trainer does not replay grammar masks"
+            )
+    for name in ("ignore_eos", "stop", "stop_token_ids", "stop_regex"):
+        if params.get(name):
+            raise ValueError(f"Balatro training cannot use {name}: actions must end naturally, without suppressing EOS or clipping trailing output")
+    # This harness does not record/replay top-p masks or logit processors.
+    # Greedy held-out evaluation is allowed; those samples never train.
+    defaults = {
+        "top_p": 1.0, "top_k": -1, "min_p": 0.0,
+        "presence_penalty": 0.0, "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+    }
+    if not evaluation:
+        defaults["temperature"] = 1.0
+    for name, expected in defaults.items():
+        if params.get(name, expected) != expected:
+            raise ValueError(
+                f"Balatro training requires {name}={expected}; sampling and training probabilities must match"
+            )
+    for name in ("logit_bias", "custom_logit_processor"):
+        if params.get(name):
+            raise ValueError(f"Balatro training cannot use {name}: the trainer does not replay logit processors")
+
+
+def _validate_balatro_sampling_config(recipe: Any) -> None:
+    """Reject incompatible sampling flags before checkpoint or launch side effects."""
+    extra = getattr(recipe, "extra_config", None) or {}
+    budget = extra.get("balatro_thinking_budget", 0)
+    if type(budget) is not int or budget not in (0, 8192):
+        raise ValueError("balatro_thinking_budget must be 0 or 8192")
+    if budget:
+        template = json.loads(getattr(recipe, "apply_chat_template_kwargs", "{}") or "{}")
+        if template.get("enable_thinking") is not True:
+            raise ValueError("Thinking runs require enable_thinking=True")
+        for name in ("rollout_max_response_len", "eval_max_response_len"):
+            if getattr(recipe, name, 0) != budget + 96:
+                raise ValueError(f"Thinking runs require {name}={budget + 96}")
+    params = {
+        name: extra.get(f"rollout_{name}", getattr(recipe, f"rollout_{name}", default))
+        for name, default in (("temperature", 1.0), ("top_p", 1.0), ("top_k", -1))
+    }
+    _validate_balatro_sampling_params(params)
+    request = extra.get("sglang_request_params", getattr(recipe, "sglang_request_params", None)) or {}
+    if not isinstance(request, dict):
+        raise ValueError("sglang_request_params must be a dictionary")
+    _validate_balatro_sampling_params(request)
+    if "sampling_params" in request:
+        _validate_balatro_sampling_params(request["sampling_params"])
 
 
 async def _generate_action(
@@ -1774,26 +1951,68 @@ async def _generate_action(
     sampling_params: dict[str, Any],
     prompt_ids: list[int],
     state_name: str,
+) -> tuple[list[int], str | None, str, list[float], list[int]]:
+    budget = _thinking_budget(args)
+    if not budget:
+        ids, text, finish, probabilities = await _sample_action_tokens(args, sampling_params, prompt_ids, 96)
+        return ids, text, finish, probabilities, [1] * len(ids)
+    tokenizer = _tokenizer(args.hf_checkpoint)
+    closing = tokenizer("</think>", add_special_tokens=False)["input_ids"]
+    if len(closing) != 1 or closing[0] == tokenizer.unk_token_id:
+        raise ValueError("Thinking requires a dedicated </think> token")
+    # A sampled close ends thinking early. At the budget, a masked control
+    # token ends thinking instead; the final answer gets its own allowance.
+    ids, text, finish, probabilities = await _sample_action_tokens(
+        args, sampling_params, prompt_ids, budget, stop_token=closing[0],
+    )
+    mask = [1] * len(ids)
+    if text is None:
+        return ids, text, finish, probabilities, mask
+    text = tokenizer.decode(ids, skip_special_tokens=False)
+    budget_hit = finish == "length" and len(ids) == budget
+    if budget_hit and closing[0] not in ids and tokenizer.eos_token_id not in ids:
+        ids += closing
+        probabilities += [0.0]  # Placeholder only: excluded by loss mask.
+        mask += [0]
+        text = tokenizer.decode(ids, skip_special_tokens=False)
+    if not ids or ids[-1] != closing[0] or not (finish == "stop" or budget_hit):
+        return ids, text, finish, probabilities, mask
+    answer_ids, answer, answer_finish, answer_probs = await _sample_action_tokens(
+        args, sampling_params, prompt_ids + ids, 96,
+    )
+    if answer is None:
+        # Keep the already sampled reasoning for negative action credit.
+        return ids, text, answer_finish, probabilities, mask
+    ids += answer_ids
+    return (ids, tokenizer.decode(ids, skip_special_tokens=False), answer_finish,
+            probabilities + answer_probs, mask + [1] * len(answer_ids))
+
+
+async def _sample_action_tokens(
+    args: Any, sampling_params: dict[str, Any], prompt_ids: list[int],
+    limit: int, *, stop_token: int | None = None,
 ) -> tuple[list[int], str | None, str, list[float]]:
     from slime.utils.http_utils import post
 
     params = deepcopy(sampling_params)
+    # Training temperature is checked at episode entry. This shared serving
+    # helper also handles greedy evaluation, which is never used for training.
+    _validate_balatro_sampling_params(params, evaluation=True)
     context_limit, _ = _balatro_context_limits(args)
     params["max_new_tokens"] = min(
-        int(params.get("max_new_tokens", 96)), 96, context_limit - 128 - len(prompt_ids)
+        int(params.get("max_new_tokens", limit)), limit, context_limit - 128 - len(prompt_ids)
     )
     if params["max_new_tokens"] <= 0:
         return [], None, "context", []
+    if stop_token is not None:
+        # Internal phase boundary only. The final action still must end at EOS;
+        # user-provided stop strings/tokens remain forbidden by validation.
+        params["stop_token_ids"] = [stop_token]
+        params["skip_special_tokens"] = False
     # The trainer computes unmasked token probabilities. SGLang applies a
     # grammar mask BEFORE returning logprobs, so constrained samples are from
     # a different policy even at temperature=1/top_p=1. Keep generation aligned
     # with training; the prompt and action validator still enforce the API.
-    for constraint in ("regex", "json_schema", "ebnf"):
-        if params.get(constraint) is not None:
-            raise ValueError(
-                f"Balatro training cannot use {constraint}: the trainer does not replay grammar masks"
-            )
-
     output = await post(
         f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate",
         {
@@ -1814,6 +2033,8 @@ async def _generate_action(
     ]
     if len(response_ids) > params["max_new_tokens"]:
         raise RuntimeError("Serving returned more tokens than requested")
+    if not response_ids or any(not math.isfinite(value) for value in log_probs):
+        raise RuntimeError("Serving returned missing or nonfinite token log probabilities")
     return response_ids, output.get("text", ""), finish, log_probs
 
 
@@ -1865,6 +2086,21 @@ def _validate_balatro_context_config(recipe: Any) -> tuple[int, int]:
     return _balatro_context_limits(SimpleNamespace(**values))
 
 
+def _invalid_action_weight(args: Any) -> float:
+    """Penalty magnitude in advantage units, independent of game-score spread."""
+    import math
+
+    extra = getattr(args, "extra_config", None) or {}
+    value = extra.get("balatro_invalid_action_weight", getattr(args, "balatro_invalid_action_weight", 5.0))
+    try:
+        weight = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("balatro_invalid_action_weight must be finite and positive") from None
+    if isinstance(value, bool) or not math.isfinite(weight) or weight <= 0:
+        raise ValueError("balatro_invalid_action_weight must be finite and positive")
+    return weight
+
+
 def _validate_balatro_loss_config(args: Any) -> None:
     """Check loss weighting locally, before launching GPUs, and on workers."""
     extra = getattr(args, "extra_config", None) or {}
@@ -1877,6 +2113,9 @@ def _validate_balatro_loss_config(args: Any) -> None:
     if mode not in {"episode", "reward_to_go"}:
         raise ValueError(f"Unknown Balatro credit assignment: {mode}")
     if mode == "reward_to_go":
+        _invalid_action_weight(args)
+        if extra.get("normalize_advantages", getattr(args, "normalize_advantages", False)):
+            raise ValueError("Action credit requires normalize_advantages=False to preserve invalid-action penalties")
         path = extra.get("custom_advantage_function_path", getattr(args, "custom_advantage_function_path", None))
         if path != "balatro_credit.compute_advantages":
             raise ValueError("reward_to_go requires the Balatro token-advantage hook")
@@ -1890,7 +2129,7 @@ def _validate_balatro_trainer(args: Any, sample_type: Any) -> None:
 
     _validate_balatro_loss_config(args)
     if "rollout_id" not in getattr(sample_type, "__dataclass_fields__", {}):
-        raise RuntimeError("This Slime Sample lacks shared rollout_id support; use the pinned Training Gym image")
+        raise RuntimeError("This Slime Sample lacks shared rollout_id support; use the pinned Modal Dojo image")
     root = Path(inspect.getfile(sample_type)).resolve().parents[1]
     if getattr(args, "balatro_credit_assignment", "episode") == "reward_to_go":
         if "train_metadata" not in getattr(sample_type, "__dataclass_fields__", {}):
@@ -1917,10 +2156,13 @@ class _SnapshotUnavailable(RuntimeError):
 class _BalatroContext:
     """Bounded inference prefixes and their exact, separately trained sequences."""
 
-    def __init__(self, tokenizer: Any, hard_limit: int, target: int):
+    def __init__(self, tokenizer: Any, hard_limit: int, target: int, *, thinking_budget: int = 0):
         self.tokenizer = tokenizer
         self.hard_limit = hard_limit
         self.target = target
+        self.thinking = bool(thinking_budget)
+        self.max_action_tokens = thinking_budget + 96 + int(self.thinking)
+        self.reserve = self.max_action_tokens + 128
         self.segments: list[dict[str, Any]] = []
         self.current: dict[str, Any] | None = None
         self.needs_reset = True
@@ -1929,9 +2171,9 @@ class _BalatroContext:
 
     def begin(self, prompt: str, user_message: str, turn: int) -> None:
         ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        if len(ids) + 96 + 128 > self.hard_limit:
+        if len(ids) + self.reserve > self.hard_limit:
             raise _StateBudgetExceeded(
-                f"Current snapshot needs {len(ids)} tokens; input allowance is {self.hard_limit - 224}"
+                f"Current snapshot needs {len(ids)} tokens; input allowance is {self.hard_limit - self.reserve}"
             )
         self.finish()
         self.current = {
@@ -1939,7 +2181,7 @@ class _BalatroContext:
             "response": "", "loss_mask": [], "log_probs": [], "actions": [],
             "turn_start": turn,
             "messages": [
-                {"role": "system", "content": BALATRO_SYSTEM_PROMPT},
+                {"role": "system", "content": _balatro_system_prompt(self.thinking)},
                 {"role": "user", "content": user_message},
             ],
         }
@@ -1952,23 +2194,36 @@ class _BalatroContext:
         if segment is None or self.needs_reset:
             raise RuntimeError("A fresh snapshot is required before generation")
         ids = segment["prompt_ids"] + segment["response_ids"]
-        if len(ids) + 224 > self.hard_limit:
+        if len(ids) + self.reserve > self.hard_limit:
             raise RuntimeError("Context manager produced an oversized request")
         return ids
 
-    def add_action(self, ids: list[int], text: str, log_probs: list[float], *, turn: int, archive_start: int) -> None:
+    def add_action(self, ids: list[int], text: str, log_probs: list[float], *, turn: int, archive_start: int,
+                   loss_mask: list[int] | None = None) -> None:
         segment = self.current
-        if not ids or len(ids) > 96 or len(ids) != len(log_probs):
+        if not ids or len(ids) > self.max_action_tokens or len(ids) != len(log_probs):
             raise RuntimeError("Missing or misaligned generated action tokens/log probabilities")
         if segment is None or len(self.input_ids()) + len(ids) > self.hard_limit:
             raise RuntimeError("Invalid action context")
+        mask = [1] * len(ids) if loss_mask is None else loss_mask
+        if len(mask) != len(ids) or any(type(m) is not int or m not in (0, 1) for m in mask) or not any(mask):
+            raise RuntimeError("Invalid generated action loss mask")
         start = len(segment["response_ids"])
+        spans = []
+        for offset, enabled in enumerate(mask):
+            if enabled:
+                if offset == 0 or not mask[offset - 1]:
+                    spans.append([start + offset, start + offset + 1])
+                else:
+                    spans[-1][1] = start + offset + 1
         segment["actions"].append({
             "turn": turn, "token_start": start, "token_end": start + len(ids),
             "episode_token_start": archive_start, "episode_token_end": archive_start + len(ids),
+            "policy_token_spans": spans, "sampled_tokens": sum(mask),
+            "forced_thinking_close": bool(self.thinking and 0 in mask),
         })
         segment["response_ids"].extend(ids)
-        segment["loss_mask"].extend([1] * len(ids))
+        segment["loss_mask"].extend(mask)
         segment["log_probs"].extend(log_probs)
         segment["response"] += text
         segment["messages"].append({"role": "assistant", "content": text})
@@ -1978,9 +2233,15 @@ class _BalatroContext:
         segment = self.current
         if segment is None:
             raise RuntimeError("Feedback without an action")
+        framed = _feedback_chat_turn(
+            self.tokenizer, feedback,
+            assistant_ended=segment["response_ids"][-1] == self.tokenizer.eos_token_id,
+            thinking=self.thinking,
+        )
+        ids = self.tokenizer(framed, add_special_tokens=False)["input_ids"]
         size = len(segment["prompt_ids"]) + len(segment["response_ids"]) + len(ids)
         segment["messages"].append({"role": "tool", "content": feedback.strip()})
-        if size + 224 > self.target or len(segment["messages"]) >= 126:
+        if size + self.reserve > self.target or len(segment["messages"]) >= 126:
             # Keep this result in the episode archive. The next request gets
             # its resulting state as a full snapshot, not a detached delta.
             self.needs_reset = True
@@ -1988,7 +2249,7 @@ class _BalatroContext:
         segment["response_ids"].extend(ids)
         segment["loss_mask"].extend([0] * len(ids))
         segment["log_probs"].extend([0.0] * len(ids))
-        segment["response"] += feedback
+        segment["response"] += framed
         self.peak_tokens = max(self.peak_tokens, size)
 
     def finish(self) -> None:
@@ -2125,7 +2386,7 @@ def _environment_feedback(
     *,
     previous_state_name: str,
     previous_compact: dict[str, Any] | None,
-    executed: ToolCall,
+    executed: ToolCall | None,
     valid: bool,
     error: str = "",
 ) -> tuple[str, dict[str, Any]]:
@@ -2137,12 +2398,12 @@ def _environment_feedback(
         # becomes SKIPPED and the next one becomes SELECT.  Include a compact,
         # explicit explanation so both the model and trajectory viewers know
         # which tag was earned and what blind is now available.
-        if executed.name == "skip" and isinstance(payload, dict):
+        if executed is not None and executed.name == "skip" and isinstance(payload, dict):
             if transition := _skip_transition(previous_compact, compact_state):
                 payload = {**payload, "action_result": transition}
     else:
         payload = {
-            "fallback": _action_payload(executed),
+            **({"fallback": _action_payload(executed)} if executed is not None else {"executed": None}),
             "error": error or "invalid_model_action",
             "state": view,
         }
@@ -2171,11 +2432,13 @@ async def generate_balatro_episode(
     """Play one continuous game; return bounded samples with one shared reward."""
     from slime.utils.types import Sample
 
+    _validate_balatro_sampling_params(sampling_params, evaluation=evaluation)
+    thinking_budget = _thinking_budget(args)
     if not evaluation:
         _validate_balatro_trainer(args, Sample)
     source_metadata = dict(getattr(sample, "metadata", None) or {})
     seed = str(source_metadata.get("balatro_seed") or sample.prompt)
-    # This budget covers only state-changing game decisions.
+    # Bound all sampled decisions, including rejected responses and retries.
     max_decisions = int(getattr(args, "balatro_max_decisions", 250))
     context_limit, segment_target = _balatro_context_limits(args)
     capture_screenshot = bool(getattr(args, "balatro_capture_screenshot", True))
@@ -2242,7 +2505,7 @@ async def generate_balatro_episode(
         return sample
 
     tokenizer = _tokenizer(args.hf_checkpoint)
-    context = _BalatroContext(tokenizer, context_limit, segment_target)
+    context = _BalatroContext(tokenizer, context_limit, segment_target, thinking_budget=thinking_budget)
     initial_prompt = ""
     initial_prompt_ids: list[int] = []
     response_token_ids: list[int] = []
@@ -2251,7 +2514,7 @@ async def generate_balatro_episode(
     trajectory_messages: list[dict[str, str]] = [
         {
             "role": "system",
-            "content": BALATRO_SYSTEM_PROMPT,
+            "content": _balatro_system_prompt(bool(thinking_budget)),
         }
     ]
     invalid_actions = 0
@@ -2260,6 +2523,12 @@ async def generate_balatro_episode(
     repaired_actions = 0
     api_errors = 0
     turns_taken = 0
+    consecutive_rejections = 0
+    executed_actions = 0
+    output_format_errors = 0
+    multiple_action_responses = 0
+    length_limit_responses = 0
+    normal_stop_responses = 0
     # Previous turn's compact state, so feedback can be sent as a delta.
     previous_compact: dict[str, Any] | None = None
     last_result: dict[str, Any] | None = None
@@ -2276,7 +2545,7 @@ async def generate_balatro_episode(
         # The last executed action and any recovery error remain available
         # even when the feedback itself is replaced by a fresh snapshot.
         payload = json.loads(feedback.split("<balatro_state>", 1)[1].split("</balatro_state>", 1)[0])
-        last_result = {"turn": turns_taken, "executed": _action_payload(executed)}
+        last_result = {"turn": turns_taken, "executed": _action_payload(executed) if executed is not None else None}
         for key in ("error", "fallback", "action_result"):
             if key in payload:
                 last_result[key] = payload[key]
@@ -2363,7 +2632,7 @@ async def generate_balatro_episode(
 
         first_turn = _turn_prompt(state)
         trajectory_messages.append({"role": "user", "content": first_turn})
-        initial_prompt = _chat_prompt(tokenizer, first_turn)
+        initial_prompt = _chat_prompt(tokenizer, first_turn, thinking=bool(thinking_budget))
         initial_prompt_ids = tokenizer(initial_prompt, add_special_tokens=False)[
             "input_ids"
         ]
@@ -2376,11 +2645,10 @@ async def generate_balatro_episode(
                 break
             if context.needs_reset:
                 first_turn = _turn_prompt(state, last_result)
-                context.begin(_chat_prompt(tokenizer, first_turn), first_turn, turn + 1)
+                context.begin(_chat_prompt(tokenizer, first_turn, thinking=bool(thinking_budget)), first_turn, turn + 1)
                 previous_compact = json.loads(_compact_state(state))
                 span("balatro.context.reset", time.monotonic(), turn=turn + 1, segment_id=len(context.segments))
 
-            turns_taken = turn + 1
             state_name = str(state.get("state", ""))
             # Reward events are aligned to the response/loss-mask sequence,
             # which excludes the initial prompt. The transition reward is
@@ -2388,7 +2656,7 @@ async def generate_balatro_episode(
             # action tokens that caused it.
             action_token_start = len(response_token_ids)
             generate_started = time.monotonic()
-            generated_ids, response, finish, generated_log_probs = await _generate_action(
+            generated_ids, response, finish, generated_log_probs, generated_mask = await _generate_action(
                 args,
                 sampling_params,
                 context.input_ids(),
@@ -2408,68 +2676,89 @@ async def generate_balatro_episode(
                 terminal_reason = "model_abort" if aborted else "context_cap"
                 break
 
+            turns_taken = turn + 1
             context.add_action(
                 generated_ids, response, generated_log_probs,
                 turn=turn + 1, archive_start=action_token_start,
+                loss_mask=generated_mask,
             )
             # Store the reward already earned BEFORE this action. Differencing
             # against the final total yields a causal return-to-go, including
             # invalid-action penalties and terminal bonuses exactly once.
             context.current["actions"][-1]["reward_before"] = sum(partial_reward_parts.values())
+            # Record interventions separately from the displayed game reward.
+            # Tokens belong to the requested action, never the harness repair.
+            action_credit = context.current["actions"][-1]
+            action_credit["invalid_events"] = 0
 
             response_token_ids.extend(generated_ids)
             action_token_end = len(response_token_ids)
-            loss_mask.extend([1] * len(generated_ids))
+            loss_mask.extend(generated_mask)
             trajectory_text += response
             trajectory_messages.append({"role": "assistant", "content": response})
 
             parse_started = time.monotonic()
-            action = _parse_action(response, state)
+            action_text = _thinking_action_text(response, bool(thinking_budget))
+            output_error = _action_output_error(action_text or "", finish)
+            output_format_errors += _single_action_object(action_text) is None
+            multiple_action_responses += _action_object_count(action_text or "") > 1
+            length_limit_responses += finish == "length"
+            normal_stop_responses += finish == "stop"
+            action = _parse_action(action_text, state) if not output_error else None
+            if thinking_budget:
+                closing = tokenizer("</think>", add_special_tokens=False)["input_ids"][0]
+                reasoning_tokens = generated_ids.index(closing) + 1 if closing in generated_ids else len(generated_ids)
+                action_credit["thinking_tokens"] = sum(generated_mask[:reasoning_tokens])
+                action_credit["final_answer_tokens"] = len(generated_ids) - reasoning_tokens
+            action_credit["finish_reason"] = finish
+            action_credit["output_error"] = output_error or ("illegal_action" if action is None else "")
             invalid = action is None
             repaired_turn = False
-            if action is None:
-                repaired = _repair_action(response, state)
+            span("balatro.action.parse", parse_started, turn=turn, valid=not invalid)
+            if invalid:
+                # Do not execute a prefix, repair, or fallback on behalf of a
+                # rejected response. Retain the full sampled span for negative
+                # credit and retry the unchanged game with explicit feedback.
+                consecutive_rejections += 1
                 invalid_actions += 1
                 invalid_turns += 1
-                if repaired is not None:
-                    repaired_actions += 1
-                    repaired_turn = True
-                    action = repaired
-                    decoded = _decode_action(response, state)
-                    _log_balatro_event(
-                        "BALATRO_ACTION_REPAIRED",
-                        {
-                            "seed": seed,
-                            "episode_id": rollout_id,
-                            "turn": turn,
-                            "state": state_name,
-                            "response": response[:500],
-                            "requested": _action_payload(decoded) if decoded else None,
-                            "repaired": _action_payload(action),
-                        },
-                    )
-                else:
-                    fallback_actions += 1
-                    action = _fallback_action(state)
-                    _log_balatro_event(
-                        "BALATRO_ACTION_ERROR",
-                        {
-                            "seed": seed,
-                            "episode_id": rollout_id,
-                            "turn": turn,
-                            "state": state_name,
-                            "error": "invalid_model_output",
-                            "response": response[:500],
-                            "fallback": _action_payload(action),
-                        },
-                    )
-            span("balatro.action.parse", parse_started, turn=turn, valid=not invalid)
+                action_credit["invalid_events"] += 1
+                partial_reward_parts["invalid_penalty"] -= 2.0
+                partial_reward_steps += 1
+                blind_reward_pending["invalid_penalty"] -= 2.0
+                ante_reward_pending["invalid_penalty"] -= 2.0
+                if blind_window_turn is None:
+                    blind_window_turn, blind_window_token = turn + 1, action_token_start
+                if ante_window_turn is None:
+                    ante_window_turn, ante_window_token = turn + 1, action_token_start
+                executed = None
+                error = (f"Rejected response: {action_credit['output_error']}. No action was executed. "
+                         "Return exactly one complete legal JSON object, no prose or extra objects, "
+                         "then end your response.")
+                _log_balatro_event("BALATRO_OUTPUT_REJECTED", {
+                    "seed": seed, "episode_id": rollout_id, "turn": turn,
+                    "reason": action_credit["output_error"], "finish": finish,
+                    "tokens": len(generated_ids), "response": response[:500],
+                    "consecutive_rejections": consecutive_rejections,
+                })
+                feedback, previous_compact = _environment_feedback(
+                    state, previous_state_name=state_name, previous_compact=previous_compact,
+                    executed=None, valid=False, error=error,
+                )
+                append_tool_feedback(feedback)
+                if consecutive_rejections >= 3:
+                    terminal_reason = "invalid_action_limit"
+                    break
+                continue
+            consecutive_rejections = 0
+            executed_actions += 1
 
             executed = action
             rpc_started = time.monotonic()
             result = await asyncio.to_thread(env.step, action)
             api_error = ""
             if result.observation.is_error:
+                action_credit["invalid_events"] += 1
                 invalid_actions += 1
                 api_errors += 1
                 api_error = result.observation.text[:500]
@@ -2717,6 +3006,7 @@ async def generate_balatro_episode(
         partial_rewards=partial_reward_parts,
     )
     reward = reward_parts["total"]
+    policy_reward = _finalize_action_credit(context.segments, reward)
     won = bool(state.get("won"))
     final_ante = int(state.get("ante_num") or 0)
     final_round = int(state.get("round_num") or 0)
@@ -2737,6 +3027,20 @@ async def generate_balatro_episode(
         "seed_group": seed,
         "episode_id": rollout_id,
         "turns": turns_taken,
+        "output_contract_version": 1,
+        "thinking_budget": thinking_budget,
+        "forced_thinking_closures": sum(a["forced_thinking_close"] for segment in context.segments for a in segment["actions"]),
+        "thinking_token_lengths": [a.get("thinking_tokens", 0)
+                                   for segment in context.segments for a in segment["actions"]],
+        "final_answer_token_lengths": [a.get("final_answer_tokens", a["token_end"] - a["token_start"])
+                                       for segment in context.segments for a in segment["actions"]],
+        "executed_actions": executed_actions,
+        "action_token_lengths": [a["sampled_tokens"]
+                                 for segment in context.segments for a in segment["actions"]],
+        "output_format_errors": output_format_errors,
+        "multiple_action_responses": multiple_action_responses,
+        "length_limit_responses": length_limit_responses,
+        "normal_stop_responses": normal_stop_responses,
         "terminal_reason": terminal_reason,
         "episode_reward": reward,
         "partial_reward": reward_parts["partial_total"],
@@ -2756,7 +3060,7 @@ async def generate_balatro_episode(
         "api_errors": api_errors,
         "context_tokens": context_tokens,
         "context_limit": context_limit,
-        "context_protocol": 1,
+        "context_protocol": 2,
         "segment_target": segment_target,
         "segment_count": len(context.segments),
         "context_rebases": len(context.segments) - 1,
@@ -2768,6 +3072,8 @@ async def generate_balatro_episode(
     }
     episode_metrics = {
         "balatro/reward_total": reward,
+        "balatro/policy_reward_total": policy_reward,
+        "balatro/intervention_reward_excluded": reward - policy_reward,
         "balatro/reward_progress": reward_parts["progress"],
         "balatro/reward_blind_clear": reward_parts["blind_clear_bonus"],
         "balatro/reward_ante_checkpoint": reward_parts["ante_checkpoint_bonus"],
@@ -2791,13 +3097,14 @@ async def generate_balatro_episode(
         "balatro/context_rebases": len(context.segments) - 1,
         "balatro/episode_archive_tokens": len(initial_prompt_ids) + len(response_token_ids),
         "balatro/action_tokens": sum(loss_mask),
-        "balatro/feedback_tokens": len(loss_mask) - sum(loss_mask),
+        "balatro/control_tokens": metadata["balatro"]["forced_thinking_closures"],
+        "balatro/feedback_tokens": len(loss_mask) - sum(loss_mask) - metadata["balatro"]["forced_thinking_closures"],
         "balatro/state_budget_exceeded": int(terminal_reason == "state_budget_exceeded"),
         "balatro/context_utilization": context_utilization,
         "balatro/tokens_per_turn": tokens_per_turn,
         "balatro/won": int(won),
     }
-    # Training Gym renders numeric top-level sample metadata as per-rollout
+    # Modal Dojo renders numeric top-level sample metadata as per-rollout
     # time-series charts. Keep the nested metrics object for the sample detail
     # view, and promote the same values so every Balatro metric is chartable.
     metadata["metrics"] = episode_metrics
@@ -2806,7 +3113,7 @@ async def generate_balatro_episode(
     if screenshot:
         metadata["image"] = screenshot
     # Keep the source compatible with framework Sample implementations that do
-    # not allow arbitrary attributes. Training Gym promotes these reserved
+    # not allow arbitrary attributes. Modal Dojo promotes these reserved
     # metadata keys into its first-class rollout fields during extraction.
     metadata["reward_granularity"] = "checkpoint"
     mapped_events = _segment_reward_events(partial_reward_trace, context.segments)
@@ -2825,14 +3132,20 @@ async def generate_balatro_episode(
         part.rollout_id = rollout_id
         part.metadata = {
             **metadata, "segment_id": index, "segment_count": len(context.segments),
-            "context_protocol": 1, "segment_turn_start": segment["turn_start"],
+            "context_protocol": 2, "segment_turn_start": segment["turn_start"],
             "segment_turn_end": segment["actions"][-1]["turn"],
             "segment_context_tokens": len(part.tokens),
             "trajectory_messages": segment["messages"], "reward_events": mapped_events[index],
             "credit_assignment": getattr(args, "balatro_credit_assignment", "episode"),
+            "policy_episode_reward": policy_reward,
             "action_credit": [
                 {"turn": action["turn"], "token_start": action["token_start"],
-                 "token_end": action["token_end"], "return_to_go": reward - action["reward_before"]}
+                 "token_end": action["token_end"],
+                 "policy_token_spans": action["policy_token_spans"],
+                 "task_return_to_go": reward - action["reward_before"],
+                 "return_to_go": action["policy_return_to_go"],
+                 "intervention_penalty": action["intervention_penalty"],
+                 "finish_reason": action["finish_reason"], "output_error": action["output_error"]}
                 for action in segment["actions"]
             ],
         }
@@ -2954,17 +3267,45 @@ def normalize_episode_rewards(
             for index in game_indices:
                 advantages[index] = game_advantage[game_id]
     if getattr(args, "balatro_credit_assignment", "episode") == "reward_to_go":
-        _assign_action_advantages(samples, seed_groups)
+        _assign_action_advantages(samples, seed_groups, invalid_weight=_invalid_action_weight(args))
     return raw, advantages
 
 
-def _assign_action_advantages(samples: list[Any], seed_groups: dict[str, list[int]]) -> None:
+def _finalize_action_credit(segments: list[dict[str, Any]], reward: float) -> float:
+    """Remove intervention rewards from policy returns, preserving task scores.
+
+    The next action's reward_before includes exactly the preceding transition.
+    The final delta includes terminal bonuses once. For a rejected action,
+    credit only its existing invalid-action penalty, never a repair's progress
+    or win bonus. Earlier valid actions retain subsequent model-earned rewards.
+    """
+    actions = [action for segment in segments for action in segment["actions"]]
+    remaining = 0.0
+    for index in range(len(actions) - 1, -1, -1):
+        action = actions[index]
+        after = actions[index + 1]["reward_before"] if index + 1 < len(actions) else reward
+        delta = float(after - action["reward_before"])
+        penalty = -2.0 * action["invalid_events"]
+        # Retain any larger negative terminal penalty, but never positive
+        # progress produced by the harness executing a different action.
+        policy_delta = min(delta, penalty) if penalty < 0 else delta
+        remaining += policy_delta
+        action["intervention_penalty"] = min(policy_delta, penalty) if penalty < 0 else 0.0
+        action["policy_return_to_go"] = remaining
+    return remaining
+
+
+def _assign_action_advantages(
+    samples: list[Any], seed_groups: dict[str, list[int]], *, invalid_weight: float = 5.0,
+) -> None:
     """Same-seed, leave-one-game-out baselines at each decision number.
 
     Ended peers have zero remaining return. Scale once per seed using complete
-    game returns (floor 1 reward unit), never separately per context segment.
-    This preserves the existing reward objective; it does not invent a poker
-    score oracle or treat overlapping dashboard checkpoint events as additive.
+    policy returns (floor 1 reward unit), never per context segment. Task scores
+    remain unchanged; policy returns exclude progress from harness interventions.
+    Rejected actions have a negative floor applied AFTER reward scaling. Neither
+    a successful repaired game nor a large reward spread can weaken it. Preserve
+    larger negative task credit rather than capping the cost of a bad action.
     """
     for indices in seed_groups.values():
         games: dict[int, dict[int, float]] = {}
@@ -2975,14 +3316,18 @@ def _assign_action_advantages(samples: list[Any], seed_groups: dict[str, list[in
             actions = (sample.metadata or {}).get("action_credit")
             if not actions:
                 raise ValueError("reward_to_go requires recorded action_credit for every sample")
-            if game in totals and not math.isclose(totals[game], _sample_reward(sample)):
+            policy_reward = float(sample.metadata["policy_episode_reward"])
+            if game in totals and not math.isclose(totals[game], policy_reward):
                 raise ValueError("Segments of one game have inconsistent total rewards")
-            totals[game] = _sample_reward(sample)
+            totals[game] = policy_reward
             if not math.isfinite(totals[game]):
                 raise ValueError("Nonfinite game reward")
             turns = games.setdefault(game, {})
             for action in actions:
                 turn, value = int(action["turn"]), float(action["return_to_go"])
+                penalty = float(action["intervention_penalty"])
+                if not math.isfinite(penalty) or penalty > 0:
+                    raise ValueError("Invalid intervention penalty")
                 if turn in turns or turn < 1 or not math.isfinite(value):
                     raise ValueError("Invalid or duplicate action return-to-go")
                 turns[turn] = value
@@ -3000,10 +3345,14 @@ def _assign_action_advantages(samples: list[Any], seed_groups: dict[str, list[in
             for action in sample.metadata["action_credit"]:
                 turn = int(action["turn"])
                 baseline = sum(turns.get(turn, 0.0) for peer, turns in games.items() if peer != game) / (len(games) - 1)
-                spans.append({
-                    "start": action["token_start"], "end": action["token_end"],
-                    "advantage": (float(action["return_to_go"]) - baseline) / scale,
-                })
+                penalty = float(action["intervention_penalty"])
+                advantage = (float(action["return_to_go"]) - baseline) / scale
+                if penalty < 0:
+                    advantage = min(advantage, penalty / scale, -invalid_weight)
+                for start, end in action.get("policy_token_spans", [[action["token_start"], action["token_end"]]]):
+                    if not action["token_start"] <= start < end <= action["token_end"]:
+                        raise ValueError("Policy token span is outside its action")
+                    spans.append({"start": start, "end": end, "advantage": advantage})
             sample.train_metadata = {
                 **(getattr(sample, "train_metadata", None) or {}),
                 "balatro_action_advantages": spans,
@@ -3011,7 +3360,7 @@ def _assign_action_advantages(samples: list[Any], seed_groups: dict[str, list[in
 
 
 # ---------------------------------------------------------------------------
-# Training Gym dataset and active run configuration
+# Modal Dojo dataset and active run configuration
 # ---------------------------------------------------------------------------
 
 
@@ -3019,7 +3368,7 @@ def _assign_action_advantages(samples: list[Any], seed_groups: dict[str, list[in
 class Qwen3_8_27B_Recipe(BaseQwen3_8_27B_Recipe):
     """Explicit Balatro topology on the current upstream Qwen preset.
 
-    Retain the recipe name because Training Gym derives the shared checkpoint
+    Retain the recipe name because Modal Dojo derives the shared checkpoint
     volume name from it. Main's preset now leaves these pipeline fields to the
     consumer and uses a different GPU/ref-load default.
     """
@@ -3075,7 +3424,8 @@ def build_train_config(
     num_rollout: int | None = None,
     load: str | None = None,
     no_load_optim: bool = False,
-    credit_assignment: str = "episode",
+    credit_assignment: str = "reward_to_go",
+    invalid_action_weight: float = 5.0,
 ) -> TrainConfig:
     if num_rollout is not None and num_rollout < 1:
         raise ValueError(f"num_rollout must be >= 1, got {num_rollout}")
@@ -3104,6 +3454,7 @@ def build_train_config(
             calculate_per_token_loss=False,
             rollout_max_response_len=96,
             rollout_temperature=1.0,
+            rollout_top_p=1.0,
             max_tokens_per_gpu=12288,
             sglang_speculative_algorithm=None,
             sglang_speculative_num_steps=None,
@@ -3126,6 +3477,8 @@ def build_train_config(
             custom_generate_function=generate_balatro_episode,
             custom_rm_function=passthrough_reward,
             custom_reward_post_process_function=normalize_episode_rewards,
+            custom_rollout_log_function="balatro_diagnostics.log_rollout",
+            custom_eval_rollout_log_function="balatro_diagnostics.log_eval",
             apply_chat_template_kwargs='{"enable_thinking": false}',
             environment={
                 "PYTHONPATH": "/root/Megatron-LM/",
@@ -3134,8 +3487,8 @@ def build_train_config(
                 # broad-layover crashed in NCCL's RAS peer-update thread during
                 # save. Disable that diagnostic subsystem for this recipe.
                 "NCCL_RAS_ENABLE": "0",
-                "TRAINING_GYM_TRAJECTORY_SAMPLE_LIMIT": "64",
-                "TRAINING_GYM_IMAGE_SAMPLE_LIMIT": "0",
+                "MODAL_DOJO_TRAJECTORY_SAMPLE_LIMIT": "64",
+                "MODAL_DOJO_IMAGE_SAMPLE_LIMIT": "0",
             },
             extra_config={
                 "balatro_max_decisions": 250,
@@ -3145,6 +3498,9 @@ def build_train_config(
                 "max_position_embeddings": 49152,
                 "sglang_context_length": 49152,
                 "balatro_credit_assignment": credit_assignment,
+                "balatro_invalid_action_weight": invalid_action_weight,
+                "normalize_advantages": False,
+                "rollout_top_k": -1,
                 **({"custom_advantage_function_path": "balatro_credit.compute_advantages"}
                    if credit_assignment == "reward_to_go" else {}),
             },
@@ -3152,6 +3508,7 @@ def build_train_config(
                 str(REPO / "training/patch_pipeline_group.py"),
                 str(REPO / "training/patch_checkpoint_rpc.py"),
                 str(REPO / "training/checkpoint_rpc.py"),
+                str(REPO / "training/balatro_diagnostics.py"),
             ] + (
                 [str(REPO / "training/balatro_credit.py")]
                 if credit_assignment == "reward_to_go" else []
@@ -3159,6 +3516,7 @@ def build_train_config(
             image_run_commands=[
                 "python /tmp/patch_pipeline_group.py",
                 "python /tmp/patch_checkpoint_rpc.py",
+                "python /tmp/balatro_diagnostics.py",
             ] + (
                 ["python /tmp/balatro_credit.py"]
                 if credit_assignment == "reward_to_go" else []
@@ -3309,6 +3667,7 @@ def _launch_training(config: TrainConfig, record_path: Path | None = None):
     # creating a submission receipt, or allocating remote resources.
     _validate_balatro_loss_config(config.recipe)
     _validate_balatro_context_config(config.recipe)
+    _validate_balatro_sampling_config(config.recipe)
     record = None
     if record_path is not None:
         try:
@@ -3325,13 +3684,13 @@ def _launch_training(config: TrainConfig, record_path: Path | None = None):
             os.fsync(record.fileno())
         checkpoint = getattr(config, "checkpoint", None)
         if checkpoint is not None:
-            # Current Training Gym ignores the legacy ``config.checkpoint``
+            # Current Modal Dojo ignores the legacy ``config.checkpoint``
             # attribute. Explicit --load preserves optimizer/RNG and rollout
             # numbering; resume_from_checkpoint instead starts a weights-only
             # seed run by default. Never silently launch from the base model.
             config.recipe.load = str(PurePosixPath(checkpoint.path).parent)
             _pin_resume_checkpoint(checkpoint)
-        # Training Gym's public launcher starts a detached Modal app. Keep this
+        # Modal Dojo's public launcher starts a detached Modal app. Keep this
         # process alive until it returns the persisted function-call handle.
         run = config.launch()
         if record is not None:
@@ -3407,7 +3766,7 @@ def _checkpoint_manifest_health(
 def _pin_resume_checkpoint(checkpoint: Checkpoint) -> None:
     """Point Megatron's run-level tracker at the validated checkpoint.
 
-    Training Gym mounts the parent run directory and passes that directory to
+    Modal Dojo mounts the parent run directory and passes that directory to
     ``--load``. Megatron then follows ``latest_checkpointed_iteration.txt``;
     selecting a Checkpoint object alone does not override that tracker.
     """
@@ -3433,7 +3792,7 @@ def _pin_resume_checkpoint(checkpoint: Checkpoint) -> None:
 def _resume_result(config: TrainConfig, training_run_id: str) -> TrainingRun:
     """Load a run and supply legacy checkpoint metadata when it is absent.
 
-    Older Training Gym launchers wrote the checkpoint directory to the legacy
+    Older Modal Dojo launchers wrote the checkpoint directory to the legacy
     train-result store but not to ``TrainingRun.metadata``.  The current API
     discovers checkpoints exclusively from that metadata, so reconstruct the
     deterministic Slime location in memory for those older runs.  Do not save
@@ -3522,9 +3881,11 @@ def _select_resume_checkpoint(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--credit-assignment", choices=("episode", "reward_to_go"), default="episode",
-        help="Keep episode GRPO for the context-only control, or test action reward-to-go.",
+        "--credit-assignment", choices=("episode", "reward_to_go"), default="reward_to_go",
+        help="Action credit with strong invalid penalties; episode is the legacy comparison control.",
     )
+    parser.add_argument("--invalid-action-weight", type=float, default=5.0,
+                        help="Minimum negative advantage magnitude for rejected actions in reward_to_go mode")
     parser.add_argument("--prepare-assets", action="store_true")
     parser.add_argument("--smoke-env", action="store_true")
     parser.add_argument(
@@ -3584,11 +3945,11 @@ def main() -> None:
     parser.add_argument(
         "--launch",
         action="store_true",
-        help="Actually launch the H100 Training Gym run.",
+        help="Actually launch the H100 Modal Dojo run.",
     )
     args = parser.parse_args()
     if args.launch and sys.version_info[:2] != (3, 12):
-        parser.error("Launch with Python 3.12 to match the Training Gym image.")
+        parser.error("Launch with Python 3.12 to match the Modal Dojo image.")
     if args.resume_iteration is not None and not args.resume_run:
         parser.error("--resume-iteration requires --resume-run")
     if args.resume_run and args.load:
@@ -3606,8 +3967,11 @@ def main() -> None:
         load=args.load,
         no_load_optim=args.no_load_optim,
         credit_assignment=args.credit_assignment,
+        invalid_action_weight=args.invalid_action_weight,
     )
+    _validate_balatro_loss_config(config.recipe)
     context_limit, segment_target = _validate_balatro_context_config(config.recipe)
+    _validate_balatro_sampling_config(config.recipe)
     print(f"Context: hard={context_limit}, segment={segment_target}; credit={args.credit_assignment}.")
     if args.save_interval is not None:
         if args.save_interval < 1:
@@ -3670,7 +4034,7 @@ def main() -> None:
             component_type=DashboardComponent.TRAJECTORY_VIEWER,
             from_path=viewer_path,
         )
-    print(f"Training Gym run id: {run.training_run_id}")
+    print(f"Modal Dojo run id: {run.training_run_id}")
 
 
 if __name__ == "__main__":

@@ -11,13 +11,65 @@ from unittest.mock import Mock
 import pytest
 
 
+def test_missing_parent_metadata_still_requires_exact_validated_checkpoint():
+    source = Path(__file__).resolve().parents[1] / "balatro_compare.py"
+    function = next(n for n in ast.parse(source.read_text()).body
+                    if isinstance(n, ast.FunctionDef) and n.name == "parent_checkpoint")
+    selected = Mock(return_value=object())
+    namespace = {"SimpleNamespace": SimpleNamespace, "PARENT": "parent", "ITERATION": 399,
+                 "h": SimpleNamespace(_resume_result=Mock(side_effect=KeyError("parent")),
+                                      _select_resume_checkpoint=selected)}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
+    recipe = type("Qwen3_8_27B_Recipe", (), {})()
+    config = SimpleNamespace(recipe=recipe)
+    assert namespace['parent_checkpoint'](config) is selected.return_value
+    run, iteration = selected.call_args.args
+    assert iteration == 399
+    assert run.metadata['checkpoint_location']['checkpoint_dir'] == '/checkpoints/parent'
+    assert run.metadata['checkpoint_location']['checkpoints_volume_name'] == 'slime-qwen3_8_27b_recipe-checkpoints'
+    selected.side_effect = FileNotFoundError('checkpoint 399 absent')
+    with pytest.raises(FileNotFoundError):
+        namespace['parent_checkpoint'](config)
+
+
+def test_checkpoint_evaluation_has_valid_scheduler_and_no_optimizer_updates():
+    source = Path(__file__).resolve().parents[1] / "balatro_compare.py"
+    tree = ast.parse(source.read_text())
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "build_checkpoint_evaluation")
+    recipe = SimpleNamespace(num_rollout=0, start_rollout_id=0, extra_config={},
+                             rollout_batch_size=8, n_samples_per_prompt=4,
+                             global_batch_size=32)
+    config = SimpleNamespace(recipe=recipe)
+    checkpoint = SimpleNamespace(path="/checkpoints/proof/iter_0000000")
+    namespace = {
+        "Path": Path, "build_comparison": lambda *args: config,
+        "h": SimpleNamespace(
+            _resume_result=lambda *args: object(),
+            _select_resume_checkpoint=lambda *args: checkpoint,
+            _validate_balatro_context_config=lambda recipe: (49152, 8192),
+        ),
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
+    result, selected = namespace["build_checkpoint_evaluation"]("proof", 0)
+    assert result is config and selected is checkpoint
+    assert list(range(recipe.start_rollout_id, recipe.num_rollout)) == []
+    # This is the pinned Slime scheduler's train_iters calculation. A zero
+    # horizon fails during initialization even when no training is requested.
+    train_iters = recipe.num_rollout * recipe.rollout_batch_size * recipe.n_samples_per_prompt // recipe.global_batch_size
+    assert train_iters > 0
+    assert recipe.load == "/checkpoints/proof"
+    assert recipe.extra_config["ckpt_step"] == 0
+
+
 @pytest.fixture
 def launcher():
     source = Path(__file__).resolve().parents[1] / "batro_modal_rl.py"
     tree = ast.parse(source.read_text())
     selected = {
         "_remaining_rollouts", "_launch_training", "_select_resume_checkpoint",
-        "_checkpoint_iteration", "_validate_balatro_loss_config",
+        "_checkpoint_iteration", "_validate_balatro_loss_config", "_invalid_action_weight",
+        "_validate_balatro_sampling_params", "_validate_balatro_sampling_config",
     }
     module = ast.Module(body=[
         node for node in tree.body
@@ -115,6 +167,29 @@ def test_context_clamp_rejected_before_submission(launcher, tmp_path):
     config = SimpleNamespace(recipe=SimpleNamespace(calculate_per_token_loss=False),
                              checkpoint=object(), launch=Mock())
     with pytest.raises(ValueError, match="context clamp"):
+        launcher.launch(config, receipt)
+    assert not receipt.exists()
+    launcher.pin.assert_not_called()
+    config.launch.assert_not_called()
+
+
+@pytest.mark.parametrize("overrides", [
+    {"rollout_temperature": 0.7},
+    {"rollout_top_p": 0.9},
+    {"extra_config": {"rollout_top_k": 50}},
+    {"extra_config": {"rollout_temperature": 0.0}},
+    {"sglang_request_params": {"regex": "json-only"}},
+    {"sglang_request_params": {"sampling_params": {"json_schema": {}}}},
+    {"extra_config": {"sglang_request_params": {"ebnf": "grammar"}}},
+    {"sglang_request_params": {"sampling_params": None}},
+])
+def test_sampling_mismatch_fails_before_launch_side_effects(launcher, tmp_path, overrides):
+    receipt = tmp_path / "launch.json"
+    config = SimpleNamespace(
+        recipe=SimpleNamespace(calculate_per_token_loss=False, **overrides),
+        checkpoint=object(), launch=Mock(),
+    )
+    with pytest.raises(ValueError):
         launcher.launch(config, receipt)
     assert not receipt.exists()
     launcher.pin.assert_not_called()

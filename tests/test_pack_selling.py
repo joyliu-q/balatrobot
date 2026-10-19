@@ -20,10 +20,11 @@ def harness():
     tree = ast.parse((ROOT / "batro_modal_rl.py").read_text())
     functions = {
         "_compact_state", "_area_items", "_slot_usage", "_sellable_indices",
-        "_purchasable_indices", "_consumable_target_bounds", "_consumable_requires_joker",
+        "_purchasable_indices", "_consumable_target_bounds", "_consumable_requires_joker", "_consumable_available",
         "_target_action_help", "_action_help", "_action_is_locally_legal", "_action_regex",
     }
-    constants = {"_INDEX", "_INDEX_LIST", "_INDEX_LIST_5", "_ALLOWED_METHODS", "_ACTION_REGEX_BY_STATE"}
+    constants = {"_INDEX", "_INDEX_LIST", "_INDEX_LIST_5", "_ALLOWED_METHODS", "_ACTION_REGEX_BY_STATE",
+                 "_CONSUMABLE_TARGET_BOUNDS", "_CONSUMABLE_REQUIRES_JOKER"}
     nodes = [node for node in tree.body if (
         isinstance(node, ast.FunctionDef) and node.name in functions
         or isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in constants for t in node.targets)
@@ -80,6 +81,36 @@ def test_existing_sale_phases(harness, phase):
     assert harness["_action_is_locally_legal"](
         SimpleNamespace(name="sell", arguments={"joker": 1}), state,
     ) is (phase != "BLIND_SELECT")
+
+
+@pytest.mark.parametrize("case", json.loads((ROOT / "tests/fixtures/consumable_capacity_failures.json").read_text()))
+def test_recorded_engine_rejections_are_never_advertised_or_accepted(harness, case):
+    state = case["state"]
+    action = SimpleNamespace(name=case["action"]["method"], arguments=case["action"]["params"])
+    parameter = "consumable" if action.name == "use" else "card"
+    hint = f"{action.name} {parameter}={action.arguments[parameter]}"
+    assert hint not in harness["_action_help"](state)
+    assert not harness["_action_is_locally_legal"](action, state)
+    # Selling a joker restores both the hint and the actual legal action.
+    after = copy.deepcopy(state)
+    after["jokers"]["cards"].pop()
+    after["jokers"]["count"] -= 1
+    assert hint in harness["_action_help"](after)
+    assert harness["_action_is_locally_legal"](action, after)
+
+
+@pytest.mark.parametrize("phase", ["SHOP", "SELECTING_HAND"])
+def test_owned_consumable_gate_preserves_legal_uses_and_eternal_sales(harness, phase):
+    state = {**pack_state(), "state": phase,
+             "round": {"hands_left": 4, "discards_left": 3},
+             "hand": {"cards": [{"key": "S_A"}]},
+             "consumables": {"cards": [{"key": "c_wraith"}, {"key": "c_mercury"}]}}
+    hint = harness["_action_help"](state)
+    assert "use consumable=0" not in hint
+    assert "use consumable=1" in hint
+    assert "sell joker=one of [1, 2, 3, 4]" in hint
+    assert harness["_action_is_locally_legal"](SimpleNamespace(name="use", arguments={"consumable": 1}), state)
+    assert not harness["_action_is_locally_legal"](SimpleNamespace(name="use", arguments={"consumable": True}), state)
 
 
 def test_lua_sale_preserves_pack_and_allows_replacement():
