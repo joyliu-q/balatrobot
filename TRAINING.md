@@ -1,5 +1,21 @@
 # Training experiments
 
+## Named sandbox image
+
+Game sandboxes use `modal.Image.from_name("balatrobot")` in the selected Modal
+environment. Publish the runtime once, and republish when its build recipe changes:
+
+```sh
+./training/dojo.sh python batro_modal_rl.py --publish-image
+./training/dojo.sh python batro_modal_rl.py --smoke-env
+```
+
+The build recipe stays in `batro_modal_rl.py`; no separate image file is needed.
+Episode startup resolves `balatrobot:latest` without rebuilding the runtime.
+Private game assets still come from the `balatro-rl-assets` volume.
+Already deployed training code keeps its previous image-loading behavior; new
+training deployments use the named image.
+
 ## Define experiments in Python
 
 [`experiments.py`](experiments.py) is the experiment catalog. Each definition

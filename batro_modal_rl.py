@@ -8,10 +8,11 @@ Sandbox, so concurrent games never share a Balatro process or save directory.
 Safe workflow (from the Modal Dojo Python 3.12 environment)::
 
     python batro_modal_rl.py --prepare-assets
+    python batro_modal_rl.py --publish-image
     python batro_modal_rl.py --smoke-env
     python batro_modal_rl.py --launch
 
-The first two commands use CPU containers only. Training is never launched
+The preparation, image publishing, and smoke commands use CPU containers only. Training is never launched
 unless ``--launch`` is passed explicitly.
 """
 
@@ -65,6 +66,7 @@ ASSET_VOLUME_NAME = "balatro-rl-assets"
 ASSET_MOUNT = "/opt/balatro-assets"
 ASSET_APP_NAME = "balatro-rl-assets"
 SANDBOX_APP_NAME = "balatro-rl-sandboxes"
+SANDBOX_IMAGE_NAME = "balatrobot"
 
 REPO = Path(__file__).resolve().parent
 # The Balatro-specific viewer is shipped with this repository.  Keep this
@@ -245,7 +247,7 @@ exec python -m balatrobot serve
 
 
 def _balatro_runtime_image() -> modal.Image:
-    """Public Linux runtime; private game bytes live only in the Volume."""
+    """Build recipe used only when explicitly publishing the named runtime."""
     return (
         modal.Image.from_registry("debian:trixie-slim", add_python="3.12")
         .run_commands(
@@ -548,7 +550,8 @@ class BalatroEnvironmentPool(SandboxEnvironmentPool):
         return SANDBOX_APP_NAME
 
     def build_image(self) -> modal.Image:
-        return _balatro_runtime_image()
+        # Episode startup resolves the published runtime without triggering builds.
+        return modal.Image.from_name(SANDBOX_IMAGE_NAME)
 
     def _diagnostics(self, sandbox: Any) -> str:
         parts: list[str] = []
@@ -3888,6 +3891,8 @@ def main() -> None:
                         help="Minimum negative advantage magnitude for rejected actions in reward_to_go mode")
     parser.add_argument("--prepare-assets", action="store_true")
     parser.add_argument("--smoke-env", action="store_true")
+    parser.add_argument("--publish-image", action="store_true",
+                        help="Build and publish the named balatrobot sandbox image (CPU only).")
     parser.add_argument(
         "--load",
         default=None,
@@ -3957,6 +3962,14 @@ def main() -> None:
 
     if args.prepare_assets:
         print(json.dumps(_prepare_assets_from_cli(), indent=2))
+    if args.publish_image:
+        with modal.enable_output():
+            image = _balatro_runtime_image()
+            image.build(modal.App.lookup(SANDBOX_APP_NAME, create_if_missing=True))
+            image.publish(SANDBOX_IMAGE_NAME)
+        print(f"Published {SANDBOX_IMAGE_NAME}:latest -> {image.object_id}", flush=True)
+        if not args.smoke_env and not args.launch:
+            return
     if args.smoke_env:
         with modal.enable_output():
             smoke_result = _smoke_environment()
