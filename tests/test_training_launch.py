@@ -87,6 +87,11 @@ def launcher():
         "_checkpoint_manifest_health": Mock(return_value=(True, "complete")),
         "_validate_balatro_context_config": context,
     }
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "ACTION_CREDIT_MODES" for target in node.targets
+        ):
+            namespace["ACTION_CREDIT_MODES"] = ast.literal_eval(node.value)
     exec(compile(module, str(source), "exec"), namespace)
     return SimpleNamespace(
         remaining=namespace["_remaining_rollouts"],
@@ -342,3 +347,47 @@ def test_multiple_new_antes_sum_their_individual_rewards(reward_helpers):
     )
     assert parts["ante_checkpoint_bonus"] == 8 * (2 + 3 + 4)
     assert parts["ante_checkpoints"] == 3
+
+
+@pytest.fixture
+def credit_resolution():
+    source = Path(__file__).resolve().parents[1] / "batro_modal_rl.py"
+    tree = ast.parse(source.read_text())
+    selected = {"_recorded_credit_assignment", "_resolve_credit_assignment"}
+    namespace = {"Any": object}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "DEFAULT_CREDIT_ASSIGNMENT" for target in node.targets
+        ):
+            namespace["DEFAULT_CREDIT_ASSIGNMENT"] = ast.literal_eval(node.value)
+    module = ast.Module(body=[
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in selected
+    ], type_ignores=[])
+    exec(compile(module, str(source), "exec"), namespace)
+    return SimpleNamespace(recorded=namespace["_recorded_credit_assignment"],
+                           resolve=namespace["_resolve_credit_assignment"])
+
+
+def test_new_runs_default_to_ante_credit(credit_resolution):
+    assert credit_resolution.resolve(None, None) == "ante"
+    assert credit_resolution.resolve("episode", None) == "episode"
+
+
+@pytest.mark.parametrize("recorded", ["episode", "reward_to_go", "ante"])
+def test_resumed_run_keeps_its_recorded_credit_mode(credit_resolution, recorded):
+    stored = {"recipe": {"custom_config_path": {"balatro_credit_assignment": recorded}}}
+    mode = credit_resolution.recorded(stored)
+    assert credit_resolution.resolve(None, mode) == recorded
+    assert credit_resolution.resolve(recorded, mode) == recorded
+
+
+def test_resume_rejects_a_different_credit_mode(credit_resolution):
+    with pytest.raises(ValueError, match="trained with --credit-assignment reward_to_go"):
+        credit_resolution.resolve("ante", "reward_to_go")
+
+
+@pytest.mark.parametrize("stored", [None, {}, {"recipe": None}, {"recipe": {"custom_config_path": {}}}])
+def test_runs_without_a_recorded_mode_use_the_requested_or_default(credit_resolution, stored):
+    assert credit_resolution.recorded(stored) is None
+    assert credit_resolution.resolve(None, None) == "ante"
+    assert credit_resolution.resolve("reward_to_go", None) == "reward_to_go"

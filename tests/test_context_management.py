@@ -82,7 +82,7 @@ def harness(monkeypatch):
     }
     constants = {
         "BALATRO_SYSTEM_PROMPT", "_DELTA_ANCHORS", "_UNCHANGED", "_ALLOWED_METHODS",
-        "ANTE_CHECKPOINT_BONUS", "FINAL_ANTE", "DECISION_CAP_PENALTY",
+        "ANTE_CHECKPOINT_BONUS", "FINAL_ANTE", "DECISION_CAP_PENALTY", "ACTION_CREDIT_MODES",
         "_CONSUMABLE_TARGET_BOUNDS", "_CONSUMABLE_REQUIRES_JOKER",
     }
     tree = ast.parse((ROOT / "batro_modal_rl.py").read_text())
@@ -406,13 +406,113 @@ def test_eval_rejects_unscored_results_before_trainer_aggregation(harness, rewar
         asyncio.run(harness["generate_balatro_comparison"](SimpleNamespace(), Sample(), {}, evaluation=True))
 
 
-def credit_sample(game, reward, returns, *, turn_start=1):
+def credit_sample(game, reward, returns, *, turn_start=1, antes=None):
+    antes = antes or [1] * len(returns)
     return SimpleNamespace(rollout_id=game, reward=reward, train_metadata=None,
                            metadata={"balatro": {"seed_group": "same"}, "policy_episode_reward": reward, "action_credit": [
-                               {"turn": turn_start + i, "token_start": 3*i,
+                               {"turn": turn_start + i, "ante": ante, "token_start": 3*i,
                                 "token_end": 3*i + 2, "return_to_go": value, "intervention_penalty": 0.0}
-                               for i, value in enumerate(returns)
+                               for i, (value, ante) in enumerate(zip(returns, antes, strict=True))
                            ]})
+
+
+def action_advantages(sample):
+    return [a["advantage"] for a in sample.train_metadata["balatro_action_advantages"]]
+
+
+ANTE_CREDIT = SimpleNamespace(balatro_credit_assignment="ante")
+
+
+def test_ante_credit_compares_games_at_the_same_ante_not_the_same_decision(harness):
+    # A spends two decisions per ante and reaches ante 3; B rushes into ante 2
+    # after one decision and dies there. B's second decision is in ante 2 while
+    # A's is still in ante 1, so decision-number baselines compare unlike
+    # situations. Totals differ by 2, so the per-seed scale is exactly 1.
+    a = credit_sample(1, 10, [10, 9, 6, 5, 1], antes=[1, 1, 2, 2, 3])
+    b = credit_sample(2, 8, [8, 3, 2], antes=[1, 2, 2])
+    harness["normalize_episode_rewards"](ANTE_CREDIT, [a, b])
+    # Ante 1: 10 vs 8. Ante 2: 6 vs 3. Ante 3: only A reached it, no baseline.
+    assert action_advantages(a) == [2, 2, 3, 3, 0]
+    assert action_advantages(b) == [-2, -3, -3]
+
+
+def test_ante_credit_baseline_excludes_peers_that_died_earlier(harness):
+    # C never leaves ante 1. Counting it as zero return in ante 2 would make
+    # both A and B look good there merely for having arrived.
+    samples = [credit_sample(1, 10, [10, 6], antes=[1, 2]),
+               credit_sample(2, 6, [6, 2], antes=[1, 2]),
+               credit_sample(3, -2, [-2], antes=[1])]
+    harness["normalize_episode_rewards"](ANTE_CREDIT, samples)
+    totals = [10, 6, -2]
+    mean = sum(totals) / 3
+    scale = math.sqrt(sum((x - mean) ** 2 for x in totals) / 3)
+    assert action_advantages(samples[0])[1] == pytest.approx((6 - 2) / scale)
+    assert action_advantages(samples[1])[1] == pytest.approx((2 - 6) / scale)
+    assert action_advantages(samples[2])[0] == pytest.approx((-2 - 8) / scale)
+
+
+def test_ante_credit_keeps_the_invalid_action_floor(harness):
+    a = credit_sample(1, 10, [10, 6], antes=[1, 2])
+    b = credit_sample(2, 8, [8, 3], antes=[1, 2])
+    a.metadata["action_credit"][1]["intervention_penalty"] = -2
+    harness["normalize_episode_rewards"](ANTE_CREDIT, [a, b])
+    assert action_advantages(a) == [2, -5]
+
+
+def test_ante_credit_is_invariant_to_segmentation_and_sample_order(harness):
+    whole = [credit_sample(1, 10, [10, 9, 6, 5, 1], antes=[1, 1, 2, 2, 3]),
+             credit_sample(2, 8, [8, 3, 2], antes=[1, 2, 2])]
+    split = [credit_sample(2, 8, [3, 2], turn_start=2, antes=[2, 2]),
+             credit_sample(1, 10, [6, 5, 1], turn_start=3, antes=[2, 2, 3]),
+             credit_sample(1, 10, [10, 9], antes=[1, 1]),
+             credit_sample(2, 8, [8], antes=[1])]
+    for samples in (whole, split):
+        harness["normalize_episode_rewards"](ANTE_CREDIT, samples)
+    def by_turn(samples):
+        return {(s.rollout_id, a["turn"]): v["advantage"] for s in samples
+                for a, v in zip(s.metadata["action_credit"], s.train_metadata["balatro_action_advantages"])}
+    assert by_turn(split) == by_turn(whole)
+
+
+@pytest.mark.parametrize("case", ["missing", "decreasing", "zero", "float"])
+def test_invalid_ante_credit_fails_closed(harness, case):
+    samples = [credit_sample(1, 10, [10, 6], antes=[1, 2]), credit_sample(2, 8, [8, 3], antes=[1, 2])]
+    action = samples[0].metadata["action_credit"][1]
+    if case == "missing":
+        action.pop("ante")
+    if case == "decreasing":
+        samples[0].metadata["action_credit"][0]["ante"] = 3
+    if case == "zero":
+        samples[0].metadata["action_credit"][0]["ante"] = 0
+    if case == "float":
+        action["ante"] = 2.0
+    with pytest.raises(ValueError, match="ante"):
+        harness["normalize_episode_rewards"](ANTE_CREDIT, samples)
+
+
+def test_ante_credit_passes_launch_validation_only_with_the_advantage_hook(harness):
+    extra = {"balatro_credit_assignment": "ante", "normalize_advantages": False}
+    with pytest.raises(ValueError, match="token-advantage hook"):
+        harness["_validate_balatro_loss_config"](SimpleNamespace(calculate_per_token_loss=False, extra_config=extra))
+    extra["custom_advantage_function_path"] = "balatro_credit.compute_advantages"
+    harness["_validate_balatro_loss_config"](SimpleNamespace(calculate_per_token_loss=False, extra_config=extra))
+
+
+def test_episode_records_the_highest_ante_entered_for_each_decision(harness, monkeypatch):
+    # The game enters ante 2, a lowering voucher drops it to ante 1, then it
+    # reaches ante 3. The lowered decision stays in the ante-2 window.
+    antes = {0: 1, 1: 2, 2: 1, 3: 3}
+    original = game_state
+
+    def staged(turn=0, *, done=False):
+        state = original(turn, done=done)
+        state["ante_num"] = antes.get(turn, 3)
+        return state
+
+    monkeypatch.setitem(globals(), "game_state", staged)
+    samples, _, _ = run_episode(harness, decisions=4)
+    actions = [a for s in samples for a in s.metadata["action_credit"]]
+    assert [a["ante"] for a in actions] == [1, 2, 2, 3]
 
 
 def test_later_bad_decision_does_not_inherit_earlier_success(harness):
