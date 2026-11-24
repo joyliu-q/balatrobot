@@ -629,6 +629,7 @@ DECISION_CAP_PENALTY = -10.0
 # Credit modes that give each action its own advantage through the
 # balatro_credit token-advantage hook: by decision number, or by ante.
 ACTION_CREDIT_MODES = {"reward_to_go", "ante"}
+DEFAULT_CREDIT_ASSIGNMENT = "ante"
 
 _ALLOWED_METHODS = {
     "SELECTING_HAND": {
@@ -3474,7 +3475,7 @@ def build_train_config(
     num_rollout: int | None = None,
     load: str | None = None,
     no_load_optim: bool = False,
-    credit_assignment: str = "reward_to_go",
+    credit_assignment: str = DEFAULT_CREDIT_ASSIGNMENT,
     invalid_action_weight: float = 5.0,
 ) -> TrainConfig:
     if num_rollout is not None and num_rollout < 1:
@@ -3861,6 +3862,32 @@ def _resume_result(config: TrainConfig, training_run_id: str) -> TrainingRun:
     return run
 
 
+def _recorded_credit_assignment(run_config: Any) -> str | None:
+    """Credit mode a launched run trained with, from its stored config.
+
+    Modal Dojo stores the recipe's extra_config under ``custom_config_path``.
+    Runs from before that was recorded return None.
+    """
+    recipe = run_config.get("recipe") if isinstance(run_config, dict) else None
+    extra = recipe.get("custom_config_path") if isinstance(recipe, dict) else None
+    mode = extra.get("balatro_credit_assignment") if isinstance(extra, dict) else None
+    return mode if isinstance(mode, str) else None
+
+
+def _resolve_credit_assignment(requested: str | None, recorded: str | None) -> str:
+    """Keep a resumed run on the credit mode it started with.
+
+    Without this, changing the default would silently switch a resumed run
+    to a different training objective partway through.
+    """
+    if requested is not None and recorded is not None and requested != recorded:
+        raise ValueError(
+            f"The resumed run trained with --credit-assignment {recorded}; "
+            f"pass that, or omit the flag, instead of {requested}"
+        )
+    return requested or recorded or DEFAULT_CREDIT_ASSIGNMENT
+
+
 def _select_resume_checkpoint(
     result: TrainingRun,
     requested_iteration: int | None,
@@ -3931,9 +3958,10 @@ def _select_resume_checkpoint(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--credit-assignment", choices=("episode", "reward_to_go", "ante"), default="reward_to_go",
-        help="Action credit with strong invalid penalties: reward_to_go compares decision numbers, "
-             "ante compares same-seed games over each ante they reached; episode is the legacy control.",
+        "--credit-assignment", choices=("episode", *sorted(ACTION_CREDIT_MODES)), default=None,
+        help="Action credit with strong invalid penalties: ante (default) compares same-seed games over "
+             "each ante they reached; reward_to_go compares decision numbers; episode is the legacy "
+             "control. A resumed run keeps the mode it started with.",
     )
     parser.add_argument("--invalid-action-weight", type=float, default=5.0,
                         help="Minimum negative advantage magnitude for rejected actions in reward_to_go and ante modes")
@@ -4023,6 +4051,14 @@ def main() -> None:
             smoke_result = _smoke_environment()
         print(json.dumps(smoke_result, indent=2))
 
+    recorded = (
+        _recorded_credit_assignment(TrainingRun.from_id(args.resume_run).config)
+        if args.resume_run else None
+    )
+    try:
+        args.credit_assignment = _resolve_credit_assignment(args.credit_assignment, recorded)
+    except ValueError as error:
+        parser.error(str(error))
     config = build_train_config(
         num_rollout=args.num_rollout,
         load=args.load,
@@ -4071,8 +4107,7 @@ def main() -> None:
         if not args.prepare_assets and not args.resume_run:
             print("First run: python batro_modal_rl.py --prepare-assets")
         launch_cmd = "python batro_modal_rl.py"
-        if args.credit_assignment != "episode":
-            launch_cmd += f" --credit-assignment {args.credit_assignment}"
+        launch_cmd += f" --credit-assignment {args.credit_assignment}"
         if args.num_rollout is not None:
             launch_cmd += f" --num-rollout {args.num_rollout}"
         if args.resume_run:

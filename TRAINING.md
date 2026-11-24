@@ -356,10 +356,16 @@ limits; workers reject a trainer/serving limit below the requested hard budget
 before acquiring a game. The 49k hard allowance permits large snapshots;
 normal histories still reset around 8k.
 
-Two experiment modes keep the context change separable from credit assignment:
+Three credit-assignment modes:
 
-- `--credit-assignment episode` (default): corrected context, existing game-level GRPO.
-- `--credit-assignment reward_to_go`: corrected context plus per-action returns.
+- `--credit-assignment ante` (default): per-action credit, compared against
+  same-seed games at the same ante (below).
+- `--credit-assignment reward_to_go`: per-action credit, compared against
+  same-seed games at the same decision number.
+- `--credit-assignment episode`: existing game-level GRPO, the comparison control.
+
+`--resume-run` keeps the mode the run was launched with. Passing a different
+`--credit-assignment` for a resumed run is an error.
 
 Reward-to-go records the reward accumulated **before** every generated action.
 Each action's remaining return is the final reward minus that prior total,
@@ -368,6 +374,17 @@ the other games on the same seed at the same decision number; ended peers
 have zero remaining return. The scale is the standard deviation of complete
 game rewards with a floor of one reward unit. This is a variance-reduction
 baseline, not a comparison between identical game states or a score oracle.
+
+Ante credit records the ante of every action (the highest ante entered so far,
+so a lowering voucher cannot move a decision back). Every action in ante k of a
+game shares one advantage: the return the game earned from its first ante-k
+action, minus the mean of that return over the other same-seed games that also
+reached ante k. Games that died earlier are left out of that ante's baseline;
+reaching ante k is credit for the earlier antes' decisions. An ante no other
+game on the seed reached gets zero advantage. Scale, invalid-action floors and
+the exclusion of repair rewards are the same as reward-to-go. Decision-number
+baselines instead compare, for example, one game's ante-2 shop with another's
+ante-3 boss.
 
 The new mode does not sum overlapping dashboard checkpoint events. It retains
 the current reward components and shared-game loss denominator. Advantages
@@ -387,7 +404,7 @@ CPU-only preflight, from the Training Gym Python 3.12 environment:
 ```sh
 uv run python /Users/joyliu/balatrobot/batro_modal_rl.py --num-rollout 1
 uv run python /Users/joyliu/balatrobot/batro_modal_rl.py --num-rollout 1 \
-  --credit-assignment reward_to_go
+  --credit-assignment episode
 ```
 
 Neither command launches GPUs. Existing runs keep their deployed code. For a
@@ -587,7 +604,7 @@ Run from the Python 3.12 Modal Dojo checkout used for launches:
 
 ### Strong invalid-action penalties
 
-The default `reward_to_go` mode assigns rejected model outputs an advantage
+The `ante` and `reward_to_go` modes assign rejected model outputs an advantage
 of **−5 or more negative**, applied after game-reward normalization. Large
 reward variance and successful harness repairs cannot shrink or reverse that
 penalty. More negative task credit is retained. Valid-action credit, displayed
