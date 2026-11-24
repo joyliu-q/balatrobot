@@ -626,6 +626,9 @@ FINAL_ANTE = 8
 # game, not an environment fault. Keep the cost large enough that a loop of
 # otherwise legal no-op actions cannot outrank actual blind progress.
 DECISION_CAP_PENALTY = -10.0
+# Credit modes that give each action its own advantage through the
+# balatro_credit token-advantage hook: by decision number, or by ante.
+ACTION_CREDIT_MODES = {"reward_to_go", "ante"}
 
 _ALLOWED_METHODS = {
     "SELECTING_HAND": {
@@ -2113,9 +2116,9 @@ def _validate_balatro_loss_config(args: Any) -> None:
     if per_token is not False:
         raise ValueError("Segmented Balatro requires calculate_per_token_loss=False (per-game mean)")
     mode = extra.get("balatro_credit_assignment", getattr(args, "balatro_credit_assignment", "episode"))
-    if mode not in {"episode", "reward_to_go"}:
+    if mode not in {"episode", *ACTION_CREDIT_MODES}:
         raise ValueError(f"Unknown Balatro credit assignment: {mode}")
-    if mode == "reward_to_go":
+    if mode in ACTION_CREDIT_MODES:
         _invalid_action_weight(args)
         if extra.get("normalize_advantages", getattr(args, "normalize_advantages", False)):
             raise ValueError("Action credit requires normalize_advantages=False to preserve invalid-action penalties")
@@ -2134,7 +2137,7 @@ def _validate_balatro_trainer(args: Any, sample_type: Any) -> None:
     if "rollout_id" not in getattr(sample_type, "__dataclass_fields__", {}):
         raise RuntimeError("This Slime Sample lacks shared rollout_id support; use the pinned Modal Dojo image")
     root = Path(inspect.getfile(sample_type)).resolve().parents[1]
-    if getattr(args, "balatro_credit_assignment", "episode") == "reward_to_go":
+    if getattr(args, "balatro_credit_assignment", "episode") in ACTION_CREDIT_MODES:
         if "train_metadata" not in getattr(sample_type, "__dataclass_fields__", {}):
             raise RuntimeError("This Slime Sample lacks train_metadata for action credit")
         if "BALATRO_TRAIN_METADATA" not in (root / "ray/rollout.py").read_text():
@@ -2568,6 +2571,9 @@ async def generate_balatro_episode(
     }
     ante_checkpoints = 0
     highest_rewarded_ante = 0
+    # Highest ante entered so far. A lowering voucher (Hieroglyph/Petroglyph)
+    # must not move later decisions back into an earlier ante's credit window.
+    credit_ante = 1
     partial_reward_steps = 0
     # Keep checkpoint-window rewards separate from the episode accumulators.
     # A blind-clear event credits everything earned since the previous blind
@@ -2693,6 +2699,10 @@ async def generate_balatro_episode(
             # Tokens belong to the requested action, never the harness repair.
             action_credit = context.current["actions"][-1]
             action_credit["invalid_events"] = 0
+            # The ante this decision is made in. The shop after a boss already
+            # belongs to the next ante, whose blinds its purchases must face.
+            credit_ante = max(credit_ante, int(state.get("ante_num") or 1))
+            action_credit["ante"] = credit_ante
 
             response_token_ids.extend(generated_ids)
             action_token_end = len(response_token_ids)
@@ -3142,7 +3152,7 @@ async def generate_balatro_episode(
             "credit_assignment": getattr(args, "balatro_credit_assignment", "episode"),
             "policy_episode_reward": policy_reward,
             "action_credit": [
-                {"turn": action["turn"], "token_start": action["token_start"],
+                {"turn": action["turn"], "ante": action["ante"], "token_start": action["token_start"],
                  "token_end": action["token_end"],
                  "policy_token_spans": action["policy_token_spans"],
                  "task_return_to_go": reward - action["reward_before"],
@@ -3269,8 +3279,11 @@ def normalize_episode_rewards(
         for game_id, game_indices in games.items():
             for index in game_indices:
                 advantages[index] = game_advantage[game_id]
-    if getattr(args, "balatro_credit_assignment", "episode") == "reward_to_go":
-        _assign_action_advantages(samples, seed_groups, invalid_weight=_invalid_action_weight(args))
+    mode = getattr(args, "balatro_credit_assignment", "episode")
+    if mode in ACTION_CREDIT_MODES:
+        _assign_action_advantages(
+            samples, seed_groups, invalid_weight=_invalid_action_weight(args), by_ante=mode == "ante",
+        )
     return raw, advantages
 
 
@@ -3300,11 +3313,23 @@ def _finalize_action_credit(segments: list[dict[str, Any]], reward: float) -> fl
 
 def _assign_action_advantages(
     samples: list[Any], seed_groups: dict[str, list[int]], *, invalid_weight: float = 5.0,
+    by_ante: bool = False,
 ) -> None:
-    """Same-seed, leave-one-game-out baselines at each decision number.
+    """Same-seed, leave-one-game-out baselines at each decision number or ante.
 
-    Ended peers have zero remaining return. Scale once per seed using complete
-    policy returns (floor 1 reward unit), never per context segment. Task scores
+    By decision number (``reward_to_go``), ended peers have zero remaining
+    return. Decision N can be the ante-2 shop in one game and the ante-3 boss in
+    another, so this compares different game situations.
+
+    By ante (``by_ante``), every decision in ante k of a game shares one
+    advantage: the return the game earned from its first ante-k decision, minus
+    the mean of that return over the peers that also reached ante k. Peers that
+    died earlier are excluded, so reaching ante k is credited to the earlier
+    antes' decisions, not to ante k's. An ante no peer reached has no baseline
+    and gets zero advantage (invalid-action floors still apply).
+
+    Scale once per seed using complete policy returns (floor 1 reward unit),
+    never per context segment. Task scores
     remain unchanged; policy returns exclude progress from harness interventions.
     Rejected actions have a negative floor applied AFTER reward scaling. Neither
     a successful repaired game nor a large reward spread can weaken it. Preserve
@@ -3312,6 +3337,7 @@ def _assign_action_advantages(
     """
     for indices in seed_groups.values():
         games: dict[int, dict[int, float]] = {}
+        game_antes: dict[int, dict[int, int]] = {}
         totals: dict[int, float] = {}
         for index in indices:
             sample = samples[index]
@@ -3334,11 +3360,26 @@ def _assign_action_advantages(
                 if turn in turns or turn < 1 or not math.isfinite(value):
                     raise ValueError("Invalid or duplicate action return-to-go")
                 turns[turn] = value
+                if by_ante:
+                    ante = action.get("ante")
+                    if type(ante) is not int:
+                        raise ValueError("Ante credit requires a recorded integer ante for every action")
+                    game_antes.setdefault(game, {})[turn] = ante
         if len(games) < 2:
             raise ValueError("reward_to_go needs at least two complete games per seed")
         for turns in games.values():
             if sorted(turns) != list(range(1, len(turns) + 1)):
                 raise ValueError("reward_to_go requires complete, contiguous game decisions")
+        # Return from each game's first decision in each ante.
+        ante_returns: dict[int, dict[int, float]] = {}
+        if by_ante:
+            for game, antes in game_antes.items():
+                ordered = [antes[turn] for turn in sorted(antes)]
+                if any(a < 1 for a in ordered) or ordered != sorted(ordered):
+                    raise ValueError("Ante credit requires positive, non-decreasing decision antes")
+                starts = ante_returns.setdefault(game, {})
+                for turn in sorted(antes):
+                    starts.setdefault(antes[turn], games[game][turn])
         mean = sum(totals.values()) / len(totals)
         scale = max(1.0, math.sqrt(sum((x - mean) ** 2 for x in totals.values()) / len(totals)))
         for index in indices:
@@ -3347,9 +3388,15 @@ def _assign_action_advantages(
             spans = []
             for action in sample.metadata["action_credit"]:
                 turn = int(action["turn"])
-                baseline = sum(turns.get(turn, 0.0) for peer, turns in games.items() if peer != game) / (len(games) - 1)
+                if by_ante:
+                    ante = game_antes[game][turn]
+                    peers = [starts[ante] for peer, starts in ante_returns.items()
+                             if peer != game and ante in starts]
+                    advantage = (ante_returns[game][ante] - sum(peers) / len(peers)) / scale if peers else 0.0
+                else:
+                    baseline = sum(turns.get(turn, 0.0) for peer, turns in games.items() if peer != game) / (len(games) - 1)
+                    advantage = (float(action["return_to_go"]) - baseline) / scale
                 penalty = float(action["intervention_penalty"])
-                advantage = (float(action["return_to_go"]) - baseline) / scale
                 if penalty < 0:
                     advantage = min(advantage, penalty / scale, -invalid_weight)
                 for start, end in action.get("policy_token_spans", [[action["token_start"], action["token_end"]]]):
@@ -3432,7 +3479,7 @@ def build_train_config(
 ) -> TrainConfig:
     if num_rollout is not None and num_rollout < 1:
         raise ValueError(f"num_rollout must be >= 1, got {num_rollout}")
-    if credit_assignment not in {"episode", "reward_to_go"}:
+    if credit_assignment not in {"episode", *ACTION_CREDIT_MODES}:
         raise ValueError(f"Unknown credit assignment: {credit_assignment}")
     return TrainConfig(
         model=Qwen3_8_27B(),
@@ -3505,7 +3552,7 @@ def build_train_config(
                 "normalize_advantages": False,
                 "rollout_top_k": -1,
                 **({"custom_advantage_function_path": "balatro_credit.compute_advantages"}
-                   if credit_assignment == "reward_to_go" else {}),
+                   if credit_assignment in ACTION_CREDIT_MODES else {}),
             },
             patch_files=[
                 str(REPO / "training/patch_pipeline_group.py"),
@@ -3514,7 +3561,7 @@ def build_train_config(
                 str(REPO / "training/balatro_diagnostics.py"),
             ] + (
                 [str(REPO / "training/balatro_credit.py")]
-                if credit_assignment == "reward_to_go" else []
+                if credit_assignment in ACTION_CREDIT_MODES else []
             ),
             image_run_commands=[
                 "python /tmp/patch_pipeline_group.py",
@@ -3522,7 +3569,7 @@ def build_train_config(
                 "python /tmp/balatro_diagnostics.py",
             ] + (
                 ["python /tmp/balatro_credit.py"]
-                if credit_assignment == "reward_to_go" else []
+                if credit_assignment in ACTION_CREDIT_MODES else []
             ),
             train_function_kwargs={"ephemeral_disk": 1_048_576},
         ),
@@ -3884,11 +3931,12 @@ def _select_resume_checkpoint(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--credit-assignment", choices=("episode", "reward_to_go"), default="reward_to_go",
-        help="Action credit with strong invalid penalties; episode is the legacy comparison control.",
+        "--credit-assignment", choices=("episode", "reward_to_go", "ante"), default="reward_to_go",
+        help="Action credit with strong invalid penalties: reward_to_go compares decision numbers, "
+             "ante compares same-seed games over each ante they reached; episode is the legacy control.",
     )
     parser.add_argument("--invalid-action-weight", type=float, default=5.0,
-                        help="Minimum negative advantage magnitude for rejected actions in reward_to_go mode")
+                        help="Minimum negative advantage magnitude for rejected actions in reward_to_go and ante modes")
     parser.add_argument("--prepare-assets", action="store_true")
     parser.add_argument("--smoke-env", action="store_true")
     parser.add_argument("--publish-image", action="store_true",

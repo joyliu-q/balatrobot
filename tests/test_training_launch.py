@@ -87,6 +87,11 @@ def launcher():
         "_checkpoint_manifest_health": Mock(return_value=(True, "complete")),
         "_validate_balatro_context_config": context,
     }
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "ACTION_CREDIT_MODES" for target in node.targets
+        ):
+            namespace["ACTION_CREDIT_MODES"] = ast.literal_eval(node.value)
     exec(compile(module, str(source), "exec"), namespace)
     return SimpleNamespace(
         remaining=namespace["_remaining_rollouts"],
